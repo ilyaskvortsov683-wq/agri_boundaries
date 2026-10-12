@@ -31,6 +31,8 @@ def ov():
 for name, body in cells:
     if name == '0_intro':
         continue
+    if OPT.get('aux') and name in ('9_segmentation_stage', '10b_stage1b_split'):
+        body = body.replace('feats, valid = read_window(win)', 'feats, valid = read_window_aux(win)', 1)
     exec(compile(body, name, 'exec'), g)
     if name == '2_params':
         ov()
@@ -58,5 +60,28 @@ for name, body in cells:
         def _rw(win):
             _LW['r'], _LW['c'] = int(win.row_off), int(win.col_off); return _orig_rw(win)
         g['read_window'] = _rw
+    if name == '9_segmentation_stage' and OPT.get('aux'):           # признаки из подложек: барьер-канал №3 и/или каналы признаков регионов
+        _A = OPT['aux']; _Z = np.load(_A['npz'])
+        _bar = np.max([_Z[k] for k in _A['bar']], 0) * float(_A.get('bar_scale', 1.0)) if _A.get('bar') else None
+        _reg = [_Z[k] * float(_A.get('reg_w', 1.0)) for k in _A.get('reg', [])]
+        _orig_rw2 = g['read_window']
+        def _sl(arr, win):                                           # окно за пределами растра → нули
+            r0, c0, h, w = int(win.row_off), int(win.col_off), int(win.height), int(win.width)
+            out = np.zeros((h, w), np.float32); ra, ca = max(r0, 0), max(c0, 0)
+            sub = arr[ra:r0 + h, ca:c0 + w]; out[ra - r0:ra - r0 + sub.shape[0], ca - c0:ca - c0 + sub.shape[1]] = sub
+            return out
+        def _rw_aux(win):
+            feats, valid = _orig_rw2(win)
+            ch = [feats, (_sl(_bar, win) if _bar is not None else np.zeros(valid.shape, np.float32))[..., None]]
+            ch += [_sl(a, win)[..., None] for a in _reg]
+            return np.concatenate(ch, -1).astype(np.float32), valid
+        g['read_window_aux'] = _rw_aux
+        _orig_sm, _orig_lr = g['smooth_feats'], g['_line_resp']
+        def _sm(feats, sigma):                                       # канал барьера в сегментацию/слияние не идёт
+            return _orig_sm(np.delete(feats, 3, -1) if feats.shape[-1] > 3 else feats, sigma)
+        def _lr(feats, sens, s_along, edge_sens=None):
+            r = _orig_lr(feats[..., :3], sens, s_along, edge_sens) if (sens or edge_sens) else 0
+            return np.maximum(r, feats[..., 3]) if (feats.shape[-1] > 3 and _bar is not None) else r
+        g['smooth_feats'], g['_line_resp'] = _sm, _lr
     if name == '14b_refine_funcs' and OPT.get('fake_basemap'):      # проверка обвязки этапа 5 без сети: шумовая «подложка»
         g['basemap_rgb'] = lambda Tb, shape: np.random.default_rng(0).integers(0, 255, (*shape, 3)).astype(np.uint8)
