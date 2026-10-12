@@ -216,27 +216,40 @@ def field_pass(fin, spots=True, classify=True):
     return cut, cl, SPOTS, SPLIT
 
 
-def save_class_outputs(cl, SPLIT):
+def save_class_outputs(cl, split):
+    global CLASS_SPLIT
+    CLASS_SPLIT = split
     save_stage(6, cl)
-    if SPLIT is not None:
-        SPLIT.to_file(stage_file(6), driver='GPKG', layer='fields_split')
-        print(f'  → слой fields_split: {len(SPLIT)} кусков')
+    if split is not None and (SAVE_STAGES is None or 6 in SAVE_STAGES):
+        split.to_file(stage_file(6), driver='GPKG', layer='fields_split')
+        print(f'  → слой fields_split: {len(split)} кусков')
     print(cl.groupby('cls_main_name').area_ha.agg(['count', 'sum']).round(0))
 
 
 # %% 14_stage4_6_run
 # Этапы 4 и 6 — один проход по полям (окно читается один раз). Если включён этап 5 и CLASSIFY_AFTER_REFINE=True,
 # классификация делается отдельным проходом уже после уточнения границ.
-FUSE_4_6 = bool(STAGES[4] and STAGES[6] and not (STAGES[5] and CLASSIFY_AFTER_REFINE))
-if STAGES[4]:
-    cut, cl, SPOTS, SPLIT = field_pass(get_input(4), spots=True, classify=FUSE_4_6)
-    if len(SPOTS):
-        print('найдено пятен:', len(SPOTS), '| по типам:', SPOTS['type'].value_counts().to_dict(), f'| {SPOTS.area_ha.sum():.0f} га')
-        SPOTS.to_file(Path(OUT_DIR) / f'spots_{RUN_MODE}.gpkg', driver='GPKG', layer='spots')
+def fused_4_6():
+    return bool(stage_on(4) and stage_on(6) and not (stage_on(5) and CLASSIFY_AFTER_REFINE))
+
+
+def do_stage4():
+    global FIELDS, SPOTS_LAYER
+    fuse = fused_4_6()
+    cut, cl, spots_gdf, split = field_pass(get_input(4), spots=True, classify=fuse)
+    SPOTS_LAYER = spots_gdf
+    if len(spots_gdf):
+        print('найдено пятен:', len(spots_gdf), '| по типам:', spots_gdf['type'].value_counts().to_dict(), f'| {spots_gdf.area_ha.sum():.0f} га')
+        if SAVE_STAGES is None:
+            spots_gdf.to_file(Path(OUT_DIR) / f'spots_{RUN_MODE}{TAG}.gpkg', driver='GPKG', layer='spots')
     FIELDS = cut
     save_stage(4, FIELDS)
-    if FUSE_4_6:
+    if fuse:
         FIELDS = cl
-        save_class_outputs(cl, SPLIT)
-else:
-    print('Этап 4 пропущен (STAGES[4]=0)')
+        save_class_outputs(cl, split)
+    return FIELDS
+
+
+STAGE_FUNCS[4] = do_stage4
+if not COMPARE:
+    do_stage4() if STAGES[4] else print('Этап 4 пропущен (STAGES[4]=0)')

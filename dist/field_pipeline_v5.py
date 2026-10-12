@@ -1,5 +1,5 @@
 # %% 0_intro [markdown]
-# # Поля Самарской области: выделение → дополнение → классификация (v3)
+# # Поля Самарской области: выделение → дополнение → классификация (v5)
 #
 # Один ноутбук, **шесть этапов (+ 1b — разбивка)**. Каждый включается флагом `1`/`0` в `STAGES`, и каждый может работать
 # **на ваших полях** (`IN_LAYERS`) — например, только классификация по уже готовому вектору.
@@ -13,6 +13,11 @@
 # | 4 | **Пятна**: вырезает из больших полей участки, резко отличающиеся по тону (жёлтые/тёмные в розовых, розовые в тёмных) | любые поля |
 # | 5 | **Уточнение по подложке** ~1 м (XYZ-тайлы), watershed по градиенту подложки, 3 прохода | любые поля |
 # | 6 | **Классификация** (вместе с этапом 4 — один проход по полям; при включённом этапе 5 по умолчанию после него): засеянное / пар / неиспользуемое (пиксельная карта → сглаживание → класс поля, второй класс при доле ≥ 25 %, разбивка) | любые поля |
+#
+# **Что нового в v5.** Гигантские полигоны (десятки тысяч га) возникали из-за *цепного слияния*: склейка через швы тайлов сливала соседние поля одного тона
+# без проверки границы, а слияние внутри тайла не ограничивало размер. Теперь слияние (внутри тайла и через швы) ограничено по размеру (`MAX_REGION_HA`)
+# и компактности (`MIN_COMPACT`), а на шве проверяется резкость границы. Режим сравнения (`COMPARE_PRESETS=True`, `RUN_MODE='test'`) прогоняет **каждый пресет
+# через все включённые этапы**, сохраняя только слой после этапа 1 и финал (`fields_final_test_<пресет>.gpkg`), и печатает сводную таблицу.
 #
 # **Скорость.** Этапы 1+2+3 делают *одну* сегментацию растра (самая дорогая часть, ~75 % времени): сегменты считаются один раз и фильтруются
 # под основные/мелкие/жёлтые поля. Этапы 4+6 читают окно каждого поля один раз. Тайлы считаются параллельно (`N_WORKERS`).
@@ -29,11 +34,40 @@
 import shapely, geopandas, skimage
 print('shapely', shapely.__version__, '| geopandas', geopandas.__version__, '| skimage', skimage.__version__)
 
+# %% 3_imports
+import os, math, json, time, hashlib, shutil, io, zipfile
+from pathlib import Path
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import shapely
+from shapely import STRtree
+from shapely.geometry import shape as shp_shape, box as shp_box, Polygon, MultiPolygon
+from shapely.affinity import affine_transform
+import rasterio
+import rasterio.warp
+from rasterio.warp import reproject, Resampling
+from rasterio.windows import Window
+from rasterio.features import shapes as rio_shapes, rasterize
+from rasterio.transform import Affine
+from scipy.ndimage import (gaussian_filter, grey_opening, grey_closing, binary_dilation,
+                           label as ndi_label, distance_transform_edt, maximum as ndi_maximum)
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
+from skimage.segmentation import slic, watershed
+from skimage.filters import sobel
+from skimage.measure import label as cc_label
+from tqdm.auto import tqdm
+
+from scipy.ndimage import uniform_filter
+
 # %% 2_params
 # ───────────── Пути ─────────────
-DRIVE_DIR      = '/content/drive/MyDrive/Colab_Notebooks/Agro_terra/SAM'
-COMPOSITE_NAME = 'SAM_composite_2026_0504_0920.tif'   # 1=max NDVI, 2=min NDVI, 3=diff (0–255); 4-й канал (маска) не обязателен
-BOUNDARY_NAME  = 'SAM.geojson'                        # None — без границы области
+DRIVE_DIR      = '/content/drive/MyDrive/Colab_Notebooks/Agro_terra/TAT'
+COMPOSITE_NAME = 'TA_composite_2026_0504_0910_8b.tif'   # 1=max NDVI, 2=min NDVI, 3=diff (0–255); 4-й канал (маска) не обязателен
+BOUNDARY_NAME  = 'TAT.geojson'                        # None — без границы области
 OUT_DIR        = f'{DRIVE_DIR}/fields_out'
 LOCAL_DIR      = '/content/work'
 COPY_LOCAL     = True
@@ -43,7 +77,7 @@ N_WORKERS = min(os.cpu_count() or 1, 3)   # процессов для тайло
 
 # ───────────── Режим ─────────────
 RUN_MODE    = 'test'        # 'test' — окно в центре растра; 'full' — вся область
-TEST_SIZE   = 2048
+TEST_SIZE   = 5048
 TEST_CENTER = (0.5, 0.5)
 TILE, HALO  = 2048, 64
 MIN_TILE_CROP = 0.002
@@ -64,7 +98,7 @@ RESUME    = True            # если этап пропущен и своего
 
 # ───────────── GEE / WorldCover ─────────────
 USE_WORLDCOVER = True       # False — без WorldCover (вся площадь считается пашней; для проверок без GEE)
-EE_PROJECT    = 'your-gcp-project'
+EE_PROJECT    = 'my-project-20260614-499410'
 WC_ASSET      = 'ESA/WorldCover/v200'   # 2021
 AGRI_CLASSES  = [40]                    # Cropland
 
@@ -95,21 +129,36 @@ BASE = dict(
     # векторизация и отбор
     MIN_FIELD_HA=15.5, FILL_HOLES_HA=10.0, SIMPLIFY_PX=0.8, MIN_WIDTH_PX=4,
     CROP_FRAC_MIN=0.4,     # доля cropland WorldCover в регионе для признания полем
+    # ограничения против гигантских «матричных» регионов (v5): слияние не должно создавать регион, который …
+    MAX_REGION_HA=800,     # … крупнее этой площади (0 — выкл.); типичное поле Самарской обл. 50–300 га
+    MIN_COMPACT=6.5,       # … «рыхлее» этого порога компактности C = n/√detΣ (прямоугольник/круг ≈ 12, цепочка полей ≪ 8; 0 — выкл.)
+    COMPACT_MIN_HA=30,     # компактность проверяется только у регионов крупнее этой площади
+    SEAM_CONSTRAIN=True,   # склейка через швы тайлов: с проверкой резкости границы (JUMP_THR), размера и компактности; False — как в v3
+    WC_BARRIER_MIN_PX=30,  # BARRIER_WC_CLASSES: компоненты WorldCover мельче этого размера (px) игнорируются (шум)
 )
 
 PRESETS = {
-    'A_best': dict(),   # = BASE: подобрано по ручной цифровке (вместе с этапом 1b)
-    'A_prev': dict(SP_SIZE_PX=140, RELAX_BETA=400),   # предыдущий «лучший» (до добавления разбивки)
-    'A_sharp': dict(JUMP_THR=12, BARRIER_THR=22, BARRIER_MIN_PX=50, RELAX_SIGMA=0.8, RELAX_BETA=400),
-    'A_smooth': dict(SMOOTH_SIGMA=1.2, SP_SIZE_PX=160, MIN_REGION_PX=150, SIMPLIFY_PX=1.0, RELAX_BETA=600),
-    'A_sensitive': dict(BARRIER_THR=18, BARRIER_MIN_PX=100, SMOOTH_SIGMA=1.2, RELAX_BETA=600),
-    'A_big': dict(MERGE_THR=60, JUMP_THR=18, SP_SIZE_PX=160, MIN_REGION_PX=200, SIMPLIFY_PX=1.0),
-    'B_belts_2': dict(COMPACTNESS=0.3, MERGE_THR=50, BARRIER_THR=35, JUMP_THR=0, BARRIER_WIDTH_PX=5, BARRIER_MIN_PX=15, BARRIER_DILATE=1,
-                      RELAX_ITERS=0, RELAX_BETA=200, RELAX_SIGMA=0.6, SP_SIZE_PX=120, MIN_REGION_PX=100, SIMPLIFY_PX=0.5, FILL_HOLES_HA=3.0, CROP_FRAC_MIN=0.5),
+    # ── семейство C: v3-база + ограничения размера/компактности/швов (главное исправление) ──
+    'C_base':     dict(),                                       # = BASE
+    'C_cap400':   dict(MAX_REGION_HA=400),                      # жёстче по размеру региона
+    'C_wc':       dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0),   # леса/застройка/вода/болота — барьеры; сёла внутри поля не заливать
+    'C_sharp':    dict(MERGE_THR=40, JUMP_THR=10, BARRIER_THR=22, RELAX_SIGMA=0.8, RELAX_BETA=400),   # чувствительнее к границам между одинаковыми полями
+    'C_sharp_wc': dict(MERGE_THR=40, JUMP_THR=10, BARRIER_THR=22, RELAX_SIGMA=0.8, RELAX_BETA=400,
+                       BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0),
+    'C_smooth':   dict(SMOOTH_SIGMA=1.2, SP_SIZE_PX=160, MIN_REGION_PX=150, SIMPLIFY_PX=1.0, RELAX_BETA=600, BARRIER_THR=22),   # глаже границы
+    'C_fine':     dict(SP_SIZE_PX=70, MIN_REGION_PX=60, JUMP_THR=12, MIN_FIELD_HA=10),                # мельче суперпиксели: больше мелких деталей
+    'C_split_soft': dict(SPLIT=dict(SENS=0.7, MIN_HA=120)),     # этап 1b мягче: режет только явные линии у крупных полигонов
+    'C_nosplit':  dict(NO_STAGES=['1b']),                       # без этапа 1b
+    # ── v3 для сравнения (даёт гигант ~38 тыс. га на сцене TAT; в сравнении по умолчанию не участвует) ──
+    'OLD_A_best': dict(MAX_REGION_HA=0, MIN_COMPACT=0, SEAM_CONSTRAIN=False),
 }
 
-STAGE1_PRESET   = 'A_best'         # что использовать
-COMPARE_PRESETS = False              # True (+ RUN_MODE='test'): прогнать ВСЕ PRESETS и показать сравнение на скринах
+STAGE1_PRESET   = 'C_base'         # что использовать
+COMPARE_PRESETS = True               # True (+ RUN_MODE='test'): каждый пресет проходит ВСЕ включённые этапы; сохраняются слой после этапа 1 и финал
+COMPARE_NAMES   = None               # какие пресеты сравнивать: список имён; None — все, кроме начинающихся с 'OLD'
+COMPARE_CENTERS = [(0.5, 0.5)]       # центры окон для картинок сравнения (доли области по x, y); на каждый — отдельный PNG
+COMPARE_WIN_PX  = 1400               # размер окна картинок, px
+GIANT_HA        = 600                # полигон крупнее — «гигант»: считается в сводной таблице и в диагностике
 
 # ───────────── Этап 1b: разбивка слипшихся полигонов ─────────────
 # Режет полигон на поля по длинным тонким линиям (лесополосы, дороги, межи) и резким ступенькам тона внутри него.
@@ -161,7 +210,7 @@ CLASSIFY_AFTER_REFINE = True             # если включён этап 5: �
 # ───────────── Этап 5: уточнение по подложке ─────────────
 REFINE_KINDS      = None      # None — все поля
 BASEMAP_URL       = 'https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}'   # любой XYZ-шаблон; соблюдайте условия провайдера
-BASEMAP_ZOOM      = 17        # ≈0.72 м/px на широте 53°; 16 → 1.4 м (в 4 раза меньше тайлов)
+BASEMAP_ZOOM      = 16        # 17 ≈ 0.72 м/px на широте 53°; 16 → 1.4 м (в 4 раза меньше тайлов)
 BASEMAP_CACHE     = '/content/basemap_cache'
 BASEMAP_WORKERS   = 6
 REFINE_RES_M      = 1.0
@@ -192,35 +241,6 @@ SPLIT_BY_CLASS    = True      # слой с разбивкой поля по г�
 SPLIT_MIN_HA      = 2.0       # куски разбивки мельче поглощаются соседним классом
 CLASS_TRAIN_LAYER = None      # для 'tree': GeoJSON/GPKG с размеченными полями
 CLASS_TRAIN_COL   = None      # колонка с классом (значения — любые метки)
-
-# %% 3_imports
-import os, math, json, time, hashlib, shutil, io, zipfile
-from pathlib import Path
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
-import numpy as np
-import pandas as pd
-import geopandas as gpd
-import shapely
-from shapely import STRtree
-from shapely.geometry import shape as shp_shape, box as shp_box, Polygon, MultiPolygon
-from shapely.affinity import affine_transform
-import rasterio
-import rasterio.warp
-from rasterio.warp import reproject, Resampling
-from rasterio.windows import Window
-from rasterio.features import shapes as rio_shapes, rasterize
-from rasterio.transform import Affine
-from scipy.ndimage import (gaussian_filter, grey_opening, grey_closing, binary_dilation,
-                           label as ndi_label, distance_transform_edt, maximum as ndi_maximum)
-from scipy.sparse import coo_matrix
-from scipy.sparse.csgraph import connected_components
-from skimage.segmentation import slic, watershed
-from skimage.filters import sobel
-from skimage.measure import label as cc_label
-from tqdm.auto import tqdm
-
-from scipy.ndimage import uniform_filter
 
 # %% 4_segmentation_funcs
 def smooth_feats(feats, sigma):
@@ -253,10 +273,35 @@ def detect_barriers(feats, valid, wcmap=None):
             keep[0] = False
             m = keep[cc]
     if len(BARRIER_WC_CLASSES) and wcmap is not None:
-        m = m | np.isin(wcmap, BARRIER_WC_CLASSES)
+        wb = np.isin(wcmap, BARRIER_WC_CLASSES)
+        if WC_BARRIER_MIN_PX > 1 and wb.any():                    # одиночные «лесные»/«застроенные» пиксели WorldCover внутри поля — шум
+            cc, _ = ndi_label(wb, structure=np.ones((3, 3)))
+            keep = np.bincount(cc.ravel()) >= WC_BARRIER_MIN_PX
+            keep[0] = False
+            wb = keep[cc]
+        m = m | wb
     if BARRIER_DILATE > 0 and m.any():
         m = binary_dilation(m, structure=np.ones((3, 3), bool), iterations=int(BARRIER_DILATE))
     return m & valid
+
+
+def _moments(flat, shape, K, x0=0.0, y0=0.0):
+    """Суммы (x, y, x², y², xy) по регионам: из них считается компактность региона без геометрических операций."""
+    h, w = shape
+    yy, xx = np.divmod(np.arange(h * w, dtype=np.int64), w)
+    xx = xx.astype(np.float64) + x0
+    yy = yy.astype(np.float64) + y0
+    cols = [xx, yy, xx * xx, yy * yy, xx * yy]
+    return np.stack([np.bincount(flat, weights=c_, minlength=K + 1) for c_ in cols], 1)
+
+
+def _compact_ratio(n, m):
+    """C = n / sqrt(det Σ): прямоугольник ≈ 12, круг ≈ 12.6, цепочка полей/L-образный «хвост» заметно меньше.
+    Инвариантна к сдвигу, повороту и растяжению осей (пиксели 6×10 м не мешают)."""
+    mx, my = m[0] / n, m[1] / n
+    vxx, vyy, vxy = m[2] / n - mx * mx + 1 / 12, m[3] / n - my * my + 1 / 12, m[4] / n - mx * my
+    det = vxx * vyy - vxy * vxy
+    return n / np.sqrt(det) if det > 1e-9 else np.inf
 
 
 def _build_graph(lab, feats):
@@ -276,10 +321,11 @@ def _build_graph(lab, feats):
     cnt = np.bincount(flat, minlength=K + 1).astype(np.float64)
     sums = np.stack([np.bincount(flat, weights=feats[..., k].ravel(), minlength=K + 1)
                      for k in range(feats.shape[-1])], 1)
-    return K, ukey // (K + 1), ukey % (K + 1), c.astype(np.float64), js, cnt, sums
+    mom = _moments(flat, lab.shape, K)
+    return K, ukey // (K + 1), ukey % (K + 1), c.astype(np.float64), js, cnt, sums, mom
 
 
-def _contract(K, u, v, c, js, cnt, sums, mp):
+def _contract(K, u, v, c, js, cnt, sums, mom, mp):
     ids = np.unique(mp[1:])
     remap = np.zeros(K + 1, np.int64)
     remap[ids] = np.arange(1, ids.size + 1)
@@ -287,18 +333,21 @@ def _contract(K, u, v, c, js, cnt, sums, mp):
     K2 = ids.size
     cnt2 = np.bincount(mp, weights=cnt, minlength=K2 + 1)
     sums2 = np.stack([np.bincount(mp, weights=sums[:, k], minlength=K2 + 1) for k in range(sums.shape[1])], 1)
+    mom2 = np.stack([np.bincount(mp, weights=mom[:, k], minlength=K2 + 1) for k in range(mom.shape[1])], 1)
     u2, v2 = mp[u], mp[v]
     keep = u2 != v2
     u2, v2, c2, j2 = u2[keep], v2[keep], c[keep], js[keep]
     lo, hi = np.minimum(u2, v2), np.maximum(u2, v2)
     ukey, inv = np.unique(lo * (K2 + 1) + hi, return_inverse=True)
     return (K2, ukey // (K2 + 1), ukey % (K2 + 1), np.bincount(inv, weights=c2, minlength=ukey.size),
-            np.bincount(inv, weights=j2, minlength=ukey.size), cnt2, sums2, mp)
+            np.bincount(inv, weights=j2, minlength=ukey.size), cnt2, sums2, mom2, mp)
 
 
-def _hac(K, u, v, c, js, cnt, sums, thr, min_contact, jump_thr):
+def _hac(K, u, v, c, js, cnt, sums, mom, thr, min_contact, jump_thr, max_px=0, min_compact=0, compact_min_px=0):
     """Иерархическое слияние (центроидная связь) на графе: всегда сливается самая близкая пара с d < thr,
-    общей границей >= min_contact px и средним скачком на границе < jump_thr. Средние пересчитываются."""
+    общей границей >= min_contact px и средним скачком на границе < jump_thr. Средние пересчитываются.
+    Ограничения против «цепного» слияния: объединённый регион не больше max_px и (если он ≥ compact_min_px)
+    не менее компактен, чем min_compact (см. _compact_ratio)."""
     import heapq
     jt = jump_thr if jump_thr else np.inf
     mean = sums / np.maximum(cnt[:, None], 1)
@@ -312,7 +361,7 @@ def _hac(K, u, v, c, js, cnt, sums, thr, min_contact, jump_thr):
     ver = [0] * (K + 1)
     alive = [True] * (K + 1)
     parent = list(range(K + 1))
-    cnt = cnt.copy(); sums = sums.copy()
+    cnt = cnt.copy(); sums = sums.copy(); mom = mom.copy()
     heap = [(float(d), int(a), int(b), 0, 0) for d, a, b in zip(d0[ok], u[ok], v[ok])]
     heapq.heapify(heap)
     while heap:
@@ -321,10 +370,15 @@ def _hac(K, u, v, c, js, cnt, sums, thr, min_contact, jump_thr):
             break
         if not (alive[a] and alive[b]) or ver[a] != va or ver[b] != vb:
             continue
+        n_ab = cnt[a] + cnt[b]
+        if max_px and n_ab > max_px:
+            continue
+        if min_compact and n_ab >= compact_min_px and _compact_ratio(n_ab, mom[a] + mom[b]) < min_compact:
+            continue
         if cnt[a] < cnt[b]:
             a, b = b, a
         alive[b] = False; parent[b] = a
-        cnt[a] += cnt[b]; sums[a] += sums[b]; ver[a] += 1
+        cnt[a] += cnt[b]; sums[a] += sums[b]; mom[a] += mom[b]; ver[a] += 1
         for n, e in adj[b].items():
             del adj[n][b]
             if n == a:
@@ -353,14 +407,14 @@ def _hac(K, u, v, c, js, cnt, sums, thr, min_contact, jump_thr):
     return mp
 
 
-def merge_regions(lab, feats, thr, min_contact, min_px, jump_thr):
+def merge_regions(lab, feats, thr, min_contact, min_px, jump_thr, max_px=0, min_compact=0, compact_min_px=0):
     """Фаза 1: иерархическое слияние (см. _hac). Фаза 2: регионы < min_px → к самому похожему соседу."""
     lab = lab.astype(np.int32)
-    K, u, v, c, js, cnt, sums = _build_graph(lab, feats)
+    K, u, v, c, js, cnt, sums, mom = _build_graph(lab, feats)
     total = np.arange(K + 1, dtype=np.int64)
     if u.size:
-        mp = _hac(K, u, v, c, js, cnt, sums, thr, min_contact, jump_thr)
-        K, u, v, c, js, cnt, sums, mp = _contract(K, u, v, c, js, cnt, sums, mp)
+        mp = _hac(K, u, v, c, js, cnt, sums, mom, thr, min_contact, jump_thr, max_px, min_compact, compact_min_px)
+        K, u, v, c, js, cnt, sums, mom, mp = _contract(K, u, v, c, js, cnt, sums, mom, mp)
         total = mp[total]
     for _ in range(30):
         if u.size == 0:
@@ -388,7 +442,7 @@ def merge_regions(lab, feats, thr, min_contact, min_px, jump_thr):
         mp[nodes[mutual]] = nodes[mutual]
         for _ in range(8):
             mp = mp[mp]
-        K, u, v, c, js, cnt, sums, mp = _contract(K, u, v, c, js, cnt, sums, mp)
+        K, u, v, c, js, cnt, sums, mom, mp = _contract(K, u, v, c, js, cnt, sums, mom, mp)
         total = mp[total]
     total[0] = 0
     return total.astype(np.int32)[lab]
@@ -455,13 +509,15 @@ def segment_regions(feats, valid, crop=None, wcmap=None):
     lab = lab.astype(np.int32)
     lab[~seg_valid] = 0
     lab = cc_label(lab, connectivity=1, background=0).astype(np.int32)   # половинки суперпикселя за барьером — разные регионы
-    lab = merge_regions(lab, f, MERGE_THR, MIN_CONTACT, MIN_REGION_PX, JUMP_THR)
+    max_px = int(MAX_REGION_HA / px_area_ha) if MAX_REGION_HA else 0
+    cmin_px = int(COMPACT_MIN_HA / px_area_ha) if COMPACT_MIN_HA else 0
+    lab = merge_regions(lab, f, MERGE_THR, MIN_CONTACT, MIN_REGION_PX, JUMP_THR, max_px, MIN_COMPACT, cmin_px)
     if RELAX_ITERS > 0:
         lab = relax_labels(lab, prep(RELAX_SIGMA), RELAX_ITERS, RELAX_BETA)
     return _compact(lab), barrier
 
 # %% 5_vector_funcs
-STAT_COLS = ['n_px', 'crop_px', 's0', 's1', 's2']
+STAT_COLS = ['n_px', 'crop_px', 's0', 's1', 's2', 'sx', 'sy', 'sxx', 'syy', 'sxy']
 
 
 def extract_polygons(lab, feats, crop, halo_off, core, region, tile_id):
@@ -482,21 +538,25 @@ def extract_polygons(lab, feats, crop, halo_off, core, region, tile_id):
     if not ok.any():
         return None
     s = [np.bincount(flat, weights=fc[..., k].ravel().astype(np.float64), minlength=n.size) for k in range(3)]
+    mom = _moments(flat, cc.shape, n.size - 1, x0=c0 - X0, y0=r0 - Y0)      # координаты относительно начала области (точность float64)
     geoms, vals = [], []
     for g, v in rio_shapes(cc.astype(np.int32), mask=ok[cc], transform=Affine(1, 0, c0, 0, 1, r0), connectivity=4):
         geoms.append(shp_shape(g)); vals.append(int(v))
     vals = np.array(vals)
     gdf = gpd.GeoDataFrame({'tile_id': tile_id, 'n_px': n[vals], 'crop_px': cr[vals],
-                            's0': s[0][vals], 's1': s[1][vals], 's2': s[2][vals]}, geometry=geoms, crs=None)
+                            's0': s[0][vals], 's1': s[1][vals], 's2': s[2][vals],
+                            'sx': mom[vals, 0], 'sy': mom[vals, 1], 'sxx': mom[vals, 2], 'syy': mom[vals, 3], 'sxy': mom[vals, 4]},
+                           geometry=geoms, crs=None)
     b = shapely.bounds(np.array(geoms, dtype=object))
     gdf['seam'] = ((b[:, 0] <= c0) & (c0 > X0)) | ((b[:, 2] >= c1) & (c1 < X1)) | \
                   ((b[:, 1] <= r0) & (r0 > Y0)) | ((b[:, 3] >= r1) & (r1 < Y1))
     return gdf
 
 
-def merge_across_seams(gdf, thr, min_shared):
-    """Склеивает фрагменты, разрезанные границей тайла: соседи из разных тайлов с общей границей >= min_shared px
-    и близкими средними (< thr)."""
+def merge_across_seams_legacy(gdf, thr, min_shared):
+    """[v3] Склеивает фрагменты, разрезанные границей тайла: соседи из разных тайлов с общей границей >= min_shared px
+    и близкими средними (< thr). Без проверки резкости границы и размера: транзитивное замыкание по швам сливает соседние
+    поля одного тона в гигантский регион (на сцене TAT — 38 тыс. га). Оставлено для сравнения (SEAM_CONSTRAIN=False)."""
     gdf = gdf.reset_index(drop=True)
     idx = np.flatnonzero(gdf['seam'].values)
     if idx.size < 2:
@@ -582,6 +642,81 @@ def finalize(gdf, T, crs, px_area_ha, min_field_ha, simplify_px, min_width_px=0,
     return out
 
 
+def merge_across_seams(gdf, thr, min_shared, jump_fn=None, jump_thr=0, max_px=0, min_compact=0, compact_min_px=0):
+    """Склейка фрагментов через швы тайлов с теми же правилами, что и слияние внутри тайла:
+    близость средних (по АГРЕГИРОВАННЫМ средним — без дрейфа цепочки), резкость границы на шве (jump_fn(geomsA, geomsB) →
+    средний скачок значений между пикселями по обе стороны шва; ≥ jump_thr — не сливать), размер ≤ max_px и компактность
+    ≥ min_compact. Пары обрабатываются жадно по возрастанию расстояния (union-find)."""
+    gdf = gdf.reset_index(drop=True)
+    idx = np.flatnonzero(gdf['seam'].values)
+    if idx.size < 2:
+        return gdf
+    geoms = gdf.geometry.values
+    sg = geoms[idx]
+    qi, ti = STRtree(sg).query(sg, predicate='intersects')
+    m = qi < ti
+    A, B = idx[qi[m]], idx[ti[m]]
+    tid = gdf['tile_id'].values
+    d_tile = tid[A] != tid[B]
+    A, B = A[d_tile], B[d_tile]
+    if A.size == 0:
+        return gdf
+    shared = shapely.length(shapely.intersection(geoms[A], geoms[B]))
+    n_px = gdf['n_px'].values.astype(np.float64)
+    S = gdf[['s0', 's1', 's2']].values.astype(np.float64)
+    mean = S / n_px[:, None]
+    dist = np.linalg.norm(mean[A] - mean[B], axis=1)
+    ok = (shared >= min_shared) & (dist < thr)
+    A, B, dist = A[ok], B[ok], dist[ok]
+    if A.size == 0:
+        return gdf
+    if jump_fn is not None and jump_thr:
+        jmp = jump_fn(geoms[A], geoms[B])
+        keep = ~(jmp >= jump_thr)                          # nan (не удалось посчитать) — не блокирует
+        A, B, dist = A[keep], B[keep], dist[keep]
+        if A.size == 0:
+            return gdf
+    n = len(gdf)
+    parent = np.arange(n)
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    agg_n, agg_s = n_px.copy(), S.copy()
+    agg_m = gdf[['sx', 'sy', 'sxx', 'syy', 'sxy']].values.astype(np.float64).copy()
+    for k in np.argsort(dist, kind='stable'):
+        ra, rb = find(A[k]), find(B[k])
+        if ra == rb:
+            continue
+        nn = agg_n[ra] + agg_n[rb]
+        if max_px and nn > max_px:
+            continue
+        if np.linalg.norm(agg_s[ra] / agg_n[ra] - agg_s[rb] / agg_n[rb]) >= thr:
+            continue
+        if min_compact and nn >= compact_min_px and _compact_ratio(nn, agg_m[ra] + agg_m[rb]) < min_compact:
+            continue
+        parent[rb] = ra
+        agg_n[ra] = nn; agg_s[ra] += agg_s[rb]; agg_m[ra] += agg_m[rb]
+    comp = np.array([find(i) for i in range(n)])
+    sizes = np.bincount(comp, minlength=n)
+    multi = sizes[comp] > 1
+    if not multi.any():
+        return gdf
+    keep_df = gdf[~multi]
+    sub = gdf[multi].copy()
+    sub['comp'] = comp[multi]
+    agg = sub.groupby('comp')[STAT_COLS].sum()
+    ug = sub.groupby('comp')['geometry'].apply(lambda s_: shapely.union_all(s_.values))
+    merged = gpd.GeoDataFrame(agg, geometry=ug.reindex(agg.index).values, crs=None)
+    merged['tile_id'] = -1
+    merged['seam'] = False
+    out = pd.concat([keep_df, merged.reset_index(drop=True)], ignore_index=True)
+    return gpd.GeoDataFrame(out, geometry='geometry', crs=None)
+
+
 # %% 6_drive_ee
 try:
     from google.colab import drive
@@ -662,7 +797,7 @@ def set_params(*overrides):
     g = globals()
     g.update(BASE)
     for o in overrides:
-        g.update(o)
+        g.update({k: v for k, v in o.items() if k in BASE})     # служебные ключи пресета (SPLIT, NO_STAGES) в параметры сегментации не попадают
     g['SEAM_THR'] = g['MERGE_THR']
 
 
@@ -681,16 +816,41 @@ def read_any(path):
     return gdf
 
 
+TAG = ''            # суффикс файлов (в режиме сравнения — '_<пресет>')
+SAVE_STAGES = None  # какие этапы сохранять в GPKG: None — все; множество — только перечисленные (режим сравнения: {1})
+
+
 def stage_file(k):
-    return Path(OUT_DIR) / f'fields_after_stage{k}_{RUN_MODE}.gpkg'
+    return Path(OUT_DIR) / f'fields_after_stage{k}_{RUN_MODE}{TAG}.gpkg'
 
 
 def save_stage(k, gdf):
+    if SAVE_STAGES is not None and k not in SAVE_STAGES:
+        print(f'  · этап {k}: {len(gdf)} полей, {gdf.area_ha.sum():,.0f} га')
+        return
     gdf.to_file(stage_file(k), driver='GPKG', layer='fields')
     print(f'  → {stage_file(k).name}: {len(gdf)} полей, {gdf.area_ha.sum():,.0f} га')
 
 
 FIELDS = None      # текущий слой полей, передаётся от этапа к этапу
+CLASS_SPLIT = None # слой разбивки поля по классам (результат этапа 6)
+SPOTS_LAYER = None # слой пятен (результат этапа 4)
+SPLIT_OVER = {}    # перекрытия параметров этапа 1b из пресета
+NO_STAGES_CUR = set()   # этапы, отключённые в текущем пресете
+STAGE_FUNCS = {}   # k → функция этапа (заполняется ячейками этапов)
+COMPARE = bool(COMPARE_PRESETS and RUN_MODE == 'test')
+
+
+def stage_on(k):
+    return bool(STAGES[k]) and k not in NO_STAGES_CUR
+
+
+def describe(gdf):
+    """Краткая статистика слоя: число, медиана/p90/максимум площади, гиганты (> GIANT_HA) и их доля площади."""
+    a = gdf.area_ha.values.astype(float)
+    big = a > GIANT_HA
+    return dict(n=len(gdf), median_ha=round(float(np.median(a)), 1), p90_ha=round(float(np.quantile(a, .9)), 1), max_ha=int(a.max()),
+                n_giant=int(big.sum()), giant_share=round(float(a[big].sum() / a.sum()), 3))
 
 
 ORDER = [1, '1b', 2, 3, 4, 5, 6]     # порядок этапов (для RESUME)
@@ -948,6 +1108,43 @@ def seg_tile(tile, tdir, exclude=None, ex_tree=None):
     return f'{len(gdf)} polygons'
 
 
+def seam_jump_fn(gA, gB):
+    """Средний скачок значений (как JUMP_THR внутри тайла) на общей границе фрагментов через шов тайла.
+    gA, gB — массивы полигонов в пиксельных координатах растра; шов — вертикальная/горизонтальная прямая с целой координатой.
+    Возвращает массив (nan — посчитать не удалось, такая пара не блокируется)."""
+    out = np.full(len(gA), np.nan)
+    inter = shapely.intersection(gA, gB)
+    pad = 3
+    for i, g_ in enumerate(inter):
+        tot, cnt = 0.0, 0
+        for part in shapely.get_parts(g_):
+            if part.geom_type != 'LineString':
+                continue
+            x0, y0, x1, y1 = [int(round(v)) for v in part.bounds]
+            vert = x0 == x1 and y1 > y0
+            if not (vert or (y0 == y1 and x1 > x0)):
+                continue
+            # окно с запасом pad для сглаживания; sl — индексы вдоль шва, k — координата шва
+            ca, cb, ra, rb = (x0 - pad - 1, x0 + pad, y0 - pad, y1 + pad) if vert else (x0 - pad, x1 + pad, y0 - pad - 1, y0 + pad)
+            ca, ra, cb, rb = max(ca, 0), max(ra, 0), min(cb, W), min(rb, H)
+            if cb <= ca or rb <= ra:
+                continue
+            f, _ = read_window(Window(ca, ra, cb - ca, rb - ra))
+            f = smooth_feats(f, SMOOTH_SIGMA)
+            if vert:
+                if not (ca <= x0 - 1 and x0 < cb):
+                    continue
+                d = np.sqrt(((f[y0 - ra:y1 - ra, x0 - 1 - ca] - f[y0 - ra:y1 - ra, x0 - ca]) ** 2).sum(-1))
+            else:
+                if not (ra <= y0 - 1 and y0 < rb):
+                    continue
+                d = np.sqrt(((f[y0 - 1 - ra, x0 - ca:x1 - ca] - f[y0 - ra, x0 - ca:x1 - ca]) ** 2).sum(-1))
+            tot += float(d.sum()); cnt += d.size
+        if cnt:
+            out[i] = tot / cnt
+    return out
+
+
 _JOB = {}
 
 
@@ -960,9 +1157,9 @@ def seg_raw(name, overrides, exclude=None):
     Результат кэшируется по тайлам; тайлы считаются параллельно (N_WORKERS процессов)."""
     set_params(*overrides)
     p = {k: globals()[k] for k in BASE}
-    p.update(TILE=TILE, HALO=HALO, REGION=REGION, AGRI=AGRI_CLASSES, WC=USE_WORLDCOVER, EX=layer_hash(exclude), V=3)
+    p.update(TILE=TILE, HALO=HALO, REGION=REGION, AGRI=AGRI_CLASSES, WC=USE_WORLDCOVER, EX=layer_hash(exclude), V=5)
     h = hashlib.md5(json.dumps(p, sort_keys=True, default=str).encode()).hexdigest()[:8]
-    tdir = Path(OUT_DIR) / f'tiles3_{RUN_MODE}_{name}_{h}'
+    tdir = Path(OUT_DIR) / f'tiles5_{RUN_MODE}_{name}_{h}'
     tdir.mkdir(parents=True, exist_ok=True)
     todo = [t_ for t_ in tiles if not ((tdir / f"tile_{t_['core'][1]:06d}_{t_['core'][0]:06d}.parquet").exists()
                                        or (tdir / f"tile_{t_['core'][1]:06d}_{t_['core'][0]:06d}.empty").exists())]
@@ -981,7 +1178,11 @@ def seg_raw(name, overrides, exclude=None):
     if not files:
         return None
     raw = gpd.GeoDataFrame(pd.concat([gpd.read_parquet(f) for f in files], ignore_index=True), geometry='geometry', crs=None)
-    return merge_across_seams(raw, SEAM_THR, MIN_CONTACT)
+    if not SEAM_CONSTRAIN:
+        return merge_across_seams_legacy(raw, SEAM_THR, MIN_CONTACT)
+    max_px = int(MAX_REGION_HA / px_area_ha) if MAX_REGION_HA else 0
+    cmin_px = int(COMPACT_MIN_HA / px_area_ha) if COMPACT_MIN_HA else 0
+    return merge_across_seams(raw, SEAM_THR, MIN_CONTACT, seam_jump_fn, JUMP_THR, max_px, MIN_COMPACT, cmin_px)
 
 
 def make_fields(merged, tone, min_ha, fill_ha, width_px, min_solidity=0.0, kind='main', crop_min=0.0, simplify_px=None):
@@ -1017,19 +1218,24 @@ def renumber(gdf):
     return gdf
 
 
-def compare_window(size=1400):
-    cx, cy = (X0 + X1) // 2, (Y0 + Y1) // 2
-    c0, r0 = max(cx - size // 2, X0), max(cy - size // 2, Y0)
+def compare_window(size=1400, center=(0.5, 0.5)):
+    cx, cy = int(X0 + (X1 - X0) * center[0]), int(Y0 + (Y1 - Y0) * center[1])
+    c0, r0 = min(max(cx - size // 2, X0), max(X1 - size, X0)), min(max(cy - size // 2, Y0), max(Y1 - size, Y0))
     return Window(c0, r0, min(size, X1 - c0), min(size, Y1 - r0))
 
 
-def plot_compare(results, win=None, cols=3, panel_px=800, path=None):
-    """Одно и то же окно композита (R=max, G=min, B=diff) + контуры каждого набора. Для скриншотов."""
-    win = win or compare_window()
+CLASS_COLORS = {'засеянное': 'yellow', 'пар': 'cyan', 'неиспользуемое': 'red'}
+
+
+def plot_compare(results, win=None, cols=3, panel_px=800, path=None, color_by_class=False):
+    """Одно и то же окно композита (R=max, G=min, B=diff) + контуры каждого набора (обрезаны по окну: гигантский полигон
+    не растягивает оси). color_by_class: цвет контура по классу поля (засеянное — жёлтый, пар — голубой, неиспользуемое — красный)."""
+    win = win or compare_window(COMPARE_WIN_PX)
     rgb = np.moveaxis(src.read([1, 2, 3], window=win, out_shape=(3, panel_px, panel_px)), 0, -1).astype(np.float32)
     rgb = np.clip(rgb / 255, 0, 1)
     wt = rasterio.windows.transform(win, T)
     xa, ya = wt * (0, 0); xb, yb = wt * (win.width, win.height)
+    x0, x1, y0, y1 = min(xa, xb), max(xa, xb), min(ya, yb), max(ya, yb)
     names = list(results)
     rows = math.ceil(len(names) / cols)
     fig, axs = plt.subplots(rows, cols, figsize=(6 * cols, 6 * rows), squeeze=False)
@@ -1037,9 +1243,18 @@ def plot_compare(results, win=None, cols=3, panel_px=800, path=None):
         ax.set_axis_off()
     for ax, n in zip(axs.ravel(), names):
         ax.imshow(rgb, extent=(xa, xb, yb, ya))
-        sub = results[n].cx[min(xa, xb):max(xa, xb), min(ya, yb):max(ya, yb)]
-        sub.boundary.plot(ax=ax, color='yellow', linewidth=0.7)
-        ax.set_title(f'{n}  (полей: {len(sub)})', fontsize=11)
+        gdf = results[n]
+        gs = gdf.geometry.clip_by_rect(x0, y0, x1, y1)
+        ok = (~gs.is_empty) & gs.geom_type.isin(['Polygon', 'MultiPolygon'])
+        if color_by_class and 'cls_main_name' in gdf.columns:
+            for cname, col in CLASS_COLORS.items():
+                sel = ok & (gdf['cls_main_name'] == cname)
+                if sel.any():
+                    gs[sel].boundary.plot(ax=ax, color=col, linewidth=0.8)
+        else:
+            gs[ok].boundary.plot(ax=ax, color='yellow', linewidth=0.7)
+        ax.set_xlim(x0, x1); ax.set_ylim(y0, y1)
+        ax.set_title(f'{n}  (полей в окне: {int(ok.sum())}, всего: {len(gdf)})', fontsize=11)
     plt.tight_layout()
     if path:
         plt.savefig(path, dpi=80)
@@ -1064,27 +1279,22 @@ def s1_param(k):
     return {**BASE, **PRESETS[STAGE1_PRESET]}[k]
 
 
-if STAGES[1]:
-    if COMPARE_PRESETS and RUN_MODE == 'test':
-        S1_RESULTS = {}
-        for nm in PRESETS:
-            t0 = time.time()
-            r = run_seg_stage(f's1_{nm}', [PRESETS[nm]], tone='pd', kind='main')
-            if r is not None:
-                S1_RESULTS[nm] = r
-                a = r.area_ha
-                SUMMARY.append(dict(preset=nm, fields=len(r), median_ha=round(a.median(), 1), p10_ha=round(a.quantile(.1), 1),
-                                    p90_ha=round(a.quantile(.9), 1), total_ha=int(a.sum()), minutes=round((time.time() - t0) / 60, 1)))
-        print(pd.DataFrame(SUMMARY).to_string(index=False))
-        plot_compare(S1_RESULTS, path=f'{OUT_DIR}/compare_stage1.png')
+def do_stage1():
+    global FIELDS
     r = make_fields(get_raw1(), 'pd', s1_param('MIN_FIELD_HA'), s1_param('FILL_HOLES_HA'), s1_param('MIN_WIDTH_PX'), 0.0, 'main',
                     simplify_px=s1_param('SIMPLIFY_PX'))
     if r is None or r.empty:
         raise RuntimeError('Этап 1: полей нет')
     FIELDS = renumber(r)
     save_stage(1, FIELDS)
-else:
-    print('Этап 1 пропущен (STAGES[1]=0)')
+    d = describe(FIELDS)
+    print(f'  этап 1: максимум {d["max_ha"]} га, полигонов > {GIANT_HA} га: {d["n_giant"]} ({d["giant_share"]:.0%} площади)')
+    return FIELDS
+
+
+STAGE_FUNCS[1] = do_stage1
+if not COMPARE:
+    do_stage1() if STAGES[1] else print('Этап 1 пропущен (STAGES[1]=0)')
 
 # %% 10b_stage1b_split
 # ───────────── Этап 1б: разбивка слипшихся полигонов ─────────────
@@ -1245,17 +1455,23 @@ def _shapes_px(lab):
         yield g_, v
 
 
-if STAGES['1b']:
-    FIELDS = renumber(split_fields(get_input('1b'))[0])
+def do_stage1b():
+    global FIELDS
+    FIELDS = renumber(split_fields(get_input('1b'), SPLIT_OVER)[0])      # SPLIT_OVER — перекрытия SPLIT из пресета
     save_stage('1b', FIELDS)
-else:
-    print('Этап 1б (разбивка) пропущен (STAGES["1b"]=0)')
+    return FIELDS
+
+
+STAGE_FUNCS['1b'] = do_stage1b
+if not COMPARE:
+    do_stage1b() if STAGES['1b'] else print('Этап 1б (разбивка) пропущен (STAGES["1b"]=0)')
 
 # %% 11_stage2_small_fields
 # Мелкие поля берутся из тех же регионов единственного прохода (get_raw1), без повторной сегментации:
 # фильтры — тон, площадь ≥ S2['MIN_FIELD_HA'], форма (толщина, выпуклость), доля пашни. Если задан свой слой (IN_LAYERS[2]),
 # новые полигоны просто вычитаются из него. S2_FINE_PASS=True — дополнительный проход более мелкой сегментацией остатка (долго).
-if STAGES[2]:
+def do_stage2():
+    global FIELDS
     base = get_input(2)
     n_new = 0
     if S2_FINE_PASS:
@@ -1273,12 +1489,17 @@ if STAGES[2]:
     FIELDS = renumber(resolve_nested(gpd.GeoDataFrame(base, geometry='geometry', crs=CRS)))
     print(f'Этап 2: добавлено {n_new} мелких полей')
     save_stage(2, FIELDS)
-else:
-    print('Этап 2 пропущен (STAGES[2]=0)')
+    return FIELDS
+
+
+STAGE_FUNCS[2] = do_stage2
+if not COMPARE:
+    do_stage2() if STAGES[2] else print('Этап 2 пропущен (STAGES[2]=0)')
 
 # %% 12_stage3_yellow_fields
 # «Жёлтые» поля — из тех же регионов (mean_min > YELLOW_MIN_THR), строже по форме и по WorldCover.
-if STAGES[3]:
+def do_stage3():
+    global FIELDS
     base = get_input(3)
     new = make_fields(get_raw1(), 'y', S3['MIN_FIELD_HA'], S3['FILL_HOLES_HA'], S3['MIN_WIDTH_PX'], S3_MIN_SOLIDITY, 'yellow',
                       crop_min=S3['CROP_FRAC_MIN'], simplify_px=s1_param('SIMPLIFY_PX'))
@@ -1291,8 +1512,12 @@ if STAGES[3]:
     FIELDS = renumber(resolve_nested(gpd.GeoDataFrame(base, geometry='geometry', crs=CRS)))
     print(f'Этап 3: добавлено {n_new} «жёлтых» полей')
     save_stage(3, FIELDS)
-else:
-    print('Этап 3 пропущен (STAGES[3]=0)')
+    return FIELDS
+
+
+STAGE_FUNCS[3] = do_stage3
+if not COMPARE:
+    do_stage3() if STAGES[3] else print('Этап 3 пропущен (STAGES[3]=0)')
 
 # %% 13_field_pass_funcs
 from scipy.ndimage import (binary_erosion, binary_opening, uniform_filter, label as ndi_label2, minimum as ndi_min_labels)
@@ -1511,30 +1736,43 @@ def field_pass(fin, spots=True, classify=True):
     return cut, cl, SPOTS, SPLIT
 
 
-def save_class_outputs(cl, SPLIT):
+def save_class_outputs(cl, split):
+    global CLASS_SPLIT
+    CLASS_SPLIT = split
     save_stage(6, cl)
-    if SPLIT is not None:
-        SPLIT.to_file(stage_file(6), driver='GPKG', layer='fields_split')
-        print(f'  → слой fields_split: {len(SPLIT)} кусков')
+    if split is not None and (SAVE_STAGES is None or 6 in SAVE_STAGES):
+        split.to_file(stage_file(6), driver='GPKG', layer='fields_split')
+        print(f'  → слой fields_split: {len(split)} кусков')
     print(cl.groupby('cls_main_name').area_ha.agg(['count', 'sum']).round(0))
 
 
 # %% 14_stage4_6_run
 # Этапы 4 и 6 — один проход по полям (окно читается один раз). Если включён этап 5 и CLASSIFY_AFTER_REFINE=True,
 # классификация делается отдельным проходом уже после уточнения границ.
-FUSE_4_6 = bool(STAGES[4] and STAGES[6] and not (STAGES[5] and CLASSIFY_AFTER_REFINE))
-if STAGES[4]:
-    cut, cl, SPOTS, SPLIT = field_pass(get_input(4), spots=True, classify=FUSE_4_6)
-    if len(SPOTS):
-        print('найдено пятен:', len(SPOTS), '| по типам:', SPOTS['type'].value_counts().to_dict(), f'| {SPOTS.area_ha.sum():.0f} га')
-        SPOTS.to_file(Path(OUT_DIR) / f'spots_{RUN_MODE}.gpkg', driver='GPKG', layer='spots')
+def fused_4_6():
+    return bool(stage_on(4) and stage_on(6) and not (stage_on(5) and CLASSIFY_AFTER_REFINE))
+
+
+def do_stage4():
+    global FIELDS, SPOTS_LAYER
+    fuse = fused_4_6()
+    cut, cl, spots_gdf, split = field_pass(get_input(4), spots=True, classify=fuse)
+    SPOTS_LAYER = spots_gdf
+    if len(spots_gdf):
+        print('найдено пятен:', len(spots_gdf), '| по типам:', spots_gdf['type'].value_counts().to_dict(), f'| {spots_gdf.area_ha.sum():.0f} га')
+        if SAVE_STAGES is None:
+            spots_gdf.to_file(Path(OUT_DIR) / f'spots_{RUN_MODE}{TAG}.gpkg', driver='GPKG', layer='spots')
     FIELDS = cut
     save_stage(4, FIELDS)
-    if FUSE_4_6:
+    if fuse:
         FIELDS = cl
-        save_class_outputs(cl, SPLIT)
-else:
-    print('Этап 4 пропущен (STAGES[4]=0)')
+        save_class_outputs(cl, split)
+    return FIELDS
+
+
+STAGE_FUNCS[4] = do_stage4
+if not COMPARE:
+    do_stage4() if STAGES[4] else print('Этап 4 пропущен (STAGES[4]=0)')
 
 # %% 14b_refine_funcs
 _ORIGIN = 20037508.342789244
@@ -1699,7 +1937,8 @@ def refine_fields(gdf, get_rgb, res=1.0, block_px=2000, margin_px=60, passes=Non
 
 
 # %% 15_stage5_refine
-if STAGES[5]:
+def do_stage5():
+    global FIELDS, WORK_CRS
     f0 = get_input(5)
     crs0 = f0.crs
     if crs0.is_projected:
@@ -1740,33 +1979,98 @@ if STAGES[5]:
             g_.cx[cxm - half:cxm + half, cym - half:cym + half].boundary.plot(ax=ax, color='yellow', linewidth=0.8)
             ax.set_title(ttl); ax.set_axis_off()
         plt.tight_layout(); plt.savefig(f'{OUT_DIR}/refine_before_after.png', dpi=80); plt.show()
-else:
-    print('Этап 5 пропущен (STAGES[5]=0)')
+    return FIELDS
+
+
+STAGE_FUNCS[5] = do_stage5
+if not COMPARE:
+    do_stage5() if STAGES[5] else print('Этап 5 пропущен (STAGES[5]=0)')
 
 # %% 16_stage6_after_refine
 # Классификация после уточнения границ (этап 5) — отдельный проход по полям. Если этапы 4 и 6 уже выполнены одним проходом
-# (FUSE_4_6), здесь ничего не делается. Если этап 4 выключен, а 6 включён — классификация идёт только здесь.
-if STAGES[6] and not FUSE_4_6:
-    _, cl, _, SPLIT = field_pass(get_input(6), spots=False, classify=True)
+# (fused_4_6), здесь ничего не делается. Если этап 4 выключен, а 6 включён — классификация идёт только здесь.
+def do_stage6():
+    global FIELDS
+    if fused_4_6():
+        return FIELDS
+    _, cl, _, split = field_pass(get_input(6), spots=False, classify=True)
     FIELDS = cl
-    save_class_outputs(cl, SPLIT)
-elif not STAGES[6]:
-    print('Этап 6 пропущен (STAGES[6]=0)')
+    save_class_outputs(cl, split)
+    return FIELDS
+
+
+STAGE_FUNCS[6] = do_stage6
+if not COMPARE:
+    do_stage6() if STAGES[6] else print('Этап 6 пропущен (STAGES[6]=0)')
 
 # %% 17_final
-if FIELDS is not None:
-    final_path = Path(OUT_DIR) / f'fields_final_{RUN_MODE}.gpkg'
+def final_outputs(overview=True):
+    """Итог: fields_final_<режим><метка>.gpkg (слой fields; fields_split — разбивка по классам; spots — пятна) + картинка обзора."""
+    final_path = Path(OUT_DIR) / f'fields_final_{RUN_MODE}{TAG}.gpkg'
     FIELDS.to_file(final_path, driver='GPKG', layer='fields')
+    if CLASS_SPLIT is not None:
+        CLASS_SPLIT.to_file(final_path, driver='GPKG', layer='fields_split')
+    if SPOTS_LAYER is not None and len(SPOTS_LAYER):
+        SPOTS_LAYER.to_file(final_path, driver='GPKG', layer='spots')
     print('итог:', final_path, '|', len(FIELDS), 'полей |', FIELDS.kind.value_counts().to_dict() if 'kind' in FIELDS.columns else '')
-    fig, ax = plt.subplots(figsize=(10, 10))
-    win = compare_window(1800)
-    rgb = np.clip(np.moveaxis(src.read([1, 2, 3], window=win, out_shape=(3, 1200, 1200)), 0, -1) / 255., 0, 1)
-    wt_ = rasterio.windows.transform(win, T)
-    xa, ya = wt_ * (0, 0); xb, yb = wt_ * (win.width, win.height)
-    ax.imshow(rgb, extent=(xa, xb, yb, ya))
-    colors = {'main': 'yellow', 'small': 'cyan', 'yellow': 'orange', 'input': 'white'}
-    for k_, c_ in colors.items():
-        s_ = FIELDS[FIELDS.kind == k_] if 'kind' in FIELDS.columns else FIELDS.iloc[0:0]
-        if len(s_):
-            s_.cx[min(xa, xb):max(xa, xb), min(ya, yb):max(ya, yb)].boundary.plot(ax=ax, color=c_, linewidth=0.8, label=k_)
-    ax.legend(); ax.set_axis_off(); plt.tight_layout(); plt.savefig(Path(OUT_DIR) / f'overview_{RUN_MODE}.png', dpi=80); plt.show()
+    if overview:
+        win = compare_window(1800)
+        plot_compare({'итог': FIELDS}, win=win, cols=1, panel_px=1200, path=Path(OUT_DIR) / f'overview_{RUN_MODE}{TAG}.png', color_by_class=True)
+
+
+if not COMPARE and FIELDS is not None:
+    final_outputs()
+
+# %% 18_compare
+# Режим сравнения пресетов (COMPARE_PRESETS=True и RUN_MODE='test'): КАЖДЫЙ пресет проходит все включённые этапы; на диск пишутся
+# только слой после этапа 1 (fields_after_stage1_test_<пресет>.gpkg) и финал (fields_final_test_<пресет>.gpkg: fields, fields_split, spots).
+# Сегментация кэшируется по параметрам, поэтому пресеты, отличающиеся только этапами (SPLIT, NO_STAGES), считаются почти мгновенно.
+COMPARE_ROWS, COMPARE_RES = [], {}
+
+
+def run_all(nm):
+    """Один пресет: этапы 1…6 подряд (по STAGES и перекрытиям пресета), финал → fields_final_<режим>_<пресет>.gpkg."""
+    global STAGE1_PRESET, RAW1, FIELDS, TAG, SAVE_STAGES, SPLIT_OVER, NO_STAGES_CUR, CLASS_SPLIT, SPOTS_LAYER
+    t0 = time.time()
+    P = PRESETS[nm]
+    STAGE1_PRESET, RAW1, FIELDS, TAG = nm, None, None, f'_{nm}'
+    SAVE_STAGES = {1}
+    SPLIT_OVER, NO_STAGES_CUR = P.get('SPLIT', {}), set(P.get('NO_STAGES', []))
+    CLASS_SPLIT = SPOTS_LAYER = None
+    row, s1 = dict(preset=nm), None
+    for k in ORDER:
+        if stage_on(k) and k in STAGE_FUNCS:
+            STAGE_FUNCS[k]()
+            if k == 1:
+                s1 = FIELDS.copy()
+                d = describe(s1)
+                row.update(n_s1=d['n'], max_ha_s1=d['max_ha'], giants_s1=d['n_giant'])
+    final_outputs(overview=False)
+    d = describe(FIELDS)
+    row.update(n=d['n'], median_ha=d['median_ha'], p90_ha=d['p90_ha'], max_ha=d['max_ha'], giants=d['n_giant'], giant_share=d['giant_share'])
+    if 'cls_main_name' in FIELDS.columns:
+        sh = FIELDS.groupby('cls_main_name').area_ha.sum() / FIELDS.area_ha.sum()
+        row.update({f'%{c}': round(100 * float(sh.get(c, 0)), 1) for c in CLASS_NAMES.values()})
+    row['min'] = round((time.time() - t0) / 60, 1)
+    COMPARE_ROWS.append(row)
+    COMPARE_RES[nm] = (s1, FIELDS.copy())
+    return row
+
+
+if COMPARE:
+    names = COMPARE_NAMES or [n_ for n_ in PRESETS if not n_.startswith('OLD')]
+    for nm in names:
+        print(f'\n══════ пресет {nm} ══════')
+        try:
+            run_all(nm)
+        except Exception as e_:
+            import traceback; traceback.print_exc()
+            COMPARE_ROWS.append(dict(preset=nm, error=str(e_)[:80]))
+    table = pd.DataFrame(COMPARE_ROWS)
+    print('\n', table.to_string(index=False))
+    table.to_csv(Path(OUT_DIR) / f'compare_summary_{RUN_MODE}.csv', index=False)
+    ok_ = {n_: v for n_, v in COMPARE_RES.items()}
+    for ci, ctr in enumerate(COMPARE_CENTERS):
+        win = compare_window(COMPARE_WIN_PX, ctr)
+        plot_compare({n_: v[0] for n_, v in ok_.items()}, win=win, path=f'{OUT_DIR}/compare_stage1_{ci}.png')
+        plot_compare({n_: v[1] for n_, v in ok_.items()}, win=win, path=f'{OUT_DIR}/compare_final_{ci}.png', color_by_class=True)

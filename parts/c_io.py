@@ -79,7 +79,7 @@ def set_params(*overrides):
     g = globals()
     g.update(BASE)
     for o in overrides:
-        g.update(o)
+        g.update({k: v for k, v in o.items() if k in BASE})     # служебные ключи пресета (SPLIT, NO_STAGES) в параметры сегментации не попадают
     g['SEAM_THR'] = g['MERGE_THR']
 
 
@@ -98,16 +98,41 @@ def read_any(path):
     return gdf
 
 
+TAG = ''            # суффикс файлов (в режиме сравнения — '_<пресет>')
+SAVE_STAGES = None  # какие этапы сохранять в GPKG: None — все; множество — только перечисленные (режим сравнения: {1})
+
+
 def stage_file(k):
-    return Path(OUT_DIR) / f'fields_after_stage{k}_{RUN_MODE}.gpkg'
+    return Path(OUT_DIR) / f'fields_after_stage{k}_{RUN_MODE}{TAG}.gpkg'
 
 
 def save_stage(k, gdf):
+    if SAVE_STAGES is not None and k not in SAVE_STAGES:
+        print(f'  · этап {k}: {len(gdf)} полей, {gdf.area_ha.sum():,.0f} га')
+        return
     gdf.to_file(stage_file(k), driver='GPKG', layer='fields')
     print(f'  → {stage_file(k).name}: {len(gdf)} полей, {gdf.area_ha.sum():,.0f} га')
 
 
 FIELDS = None      # текущий слой полей, передаётся от этапа к этапу
+CLASS_SPLIT = None # слой разбивки поля по классам (результат этапа 6)
+SPOTS_LAYER = None # слой пятен (результат этапа 4)
+SPLIT_OVER = {}    # перекрытия параметров этапа 1b из пресета
+NO_STAGES_CUR = set()   # этапы, отключённые в текущем пресете
+STAGE_FUNCS = {}   # k → функция этапа (заполняется ячейками этапов)
+COMPARE = bool(COMPARE_PRESETS and RUN_MODE == 'test')
+
+
+def stage_on(k):
+    return bool(STAGES[k]) and k not in NO_STAGES_CUR
+
+
+def describe(gdf):
+    """Краткая статистика слоя: число, медиана/p90/максимум площади, гиганты (> GIANT_HA) и их доля площади."""
+    a = gdf.area_ha.values.astype(float)
+    big = a > GIANT_HA
+    return dict(n=len(gdf), median_ha=round(float(np.median(a)), 1), p90_ha=round(float(np.quantile(a, .9)), 1), max_ha=int(a.max()),
+                n_giant=int(big.sum()), giant_share=round(float(a[big].sum() / a.sum()), 3))
 
 
 ORDER = [1, '1b', 2, 3, 4, 5, 6]     # порядок этапов (для RESUME)

@@ -56,10 +56,35 @@ def detect_barriers(feats, valid, wcmap=None):
             keep[0] = False
             m = keep[cc]
     if len(BARRIER_WC_CLASSES) and wcmap is not None:
-        m = m | np.isin(wcmap, BARRIER_WC_CLASSES)
+        wb = np.isin(wcmap, BARRIER_WC_CLASSES)
+        if WC_BARRIER_MIN_PX > 1 and wb.any():                    # одиночные «лесные»/«застроенные» пиксели WorldCover внутри поля — шум
+            cc, _ = ndi_label(wb, structure=np.ones((3, 3)))
+            keep = np.bincount(cc.ravel()) >= WC_BARRIER_MIN_PX
+            keep[0] = False
+            wb = keep[cc]
+        m = m | wb
     if BARRIER_DILATE > 0 and m.any():
         m = binary_dilation(m, structure=np.ones((3, 3), bool), iterations=int(BARRIER_DILATE))
     return m & valid
+
+
+def _moments(flat, shape, K, x0=0.0, y0=0.0):
+    """Суммы (x, y, x², y², xy) по регионам: из них считается компактность региона без геометрических операций."""
+    h, w = shape
+    yy, xx = np.divmod(np.arange(h * w, dtype=np.int64), w)
+    xx = xx.astype(np.float64) + x0
+    yy = yy.astype(np.float64) + y0
+    cols = [xx, yy, xx * xx, yy * yy, xx * yy]
+    return np.stack([np.bincount(flat, weights=c_, minlength=K + 1) for c_ in cols], 1)
+
+
+def _compact_ratio(n, m):
+    """C = n / sqrt(det Σ): прямоугольник ≈ 12, круг ≈ 12.6, цепочка полей/L-образный «хвост» заметно меньше.
+    Инвариантна к сдвигу, повороту и растяжению осей (пиксели 6×10 м не мешают)."""
+    mx, my = m[0] / n, m[1] / n
+    vxx, vyy, vxy = m[2] / n - mx * mx + 1 / 12, m[3] / n - my * my + 1 / 12, m[4] / n - mx * my
+    det = vxx * vyy - vxy * vxy
+    return n / np.sqrt(det) if det > 1e-9 else np.inf
 
 
 def _build_graph(lab, feats):
@@ -79,10 +104,11 @@ def _build_graph(lab, feats):
     cnt = np.bincount(flat, minlength=K + 1).astype(np.float64)
     sums = np.stack([np.bincount(flat, weights=feats[..., k].ravel(), minlength=K + 1)
                      for k in range(feats.shape[-1])], 1)
-    return K, ukey // (K + 1), ukey % (K + 1), c.astype(np.float64), js, cnt, sums
+    mom = _moments(flat, lab.shape, K)
+    return K, ukey // (K + 1), ukey % (K + 1), c.astype(np.float64), js, cnt, sums, mom
 
 
-def _contract(K, u, v, c, js, cnt, sums, mp):
+def _contract(K, u, v, c, js, cnt, sums, mom, mp):
     ids = np.unique(mp[1:])
     remap = np.zeros(K + 1, np.int64)
     remap[ids] = np.arange(1, ids.size + 1)
@@ -90,18 +116,21 @@ def _contract(K, u, v, c, js, cnt, sums, mp):
     K2 = ids.size
     cnt2 = np.bincount(mp, weights=cnt, minlength=K2 + 1)
     sums2 = np.stack([np.bincount(mp, weights=sums[:, k], minlength=K2 + 1) for k in range(sums.shape[1])], 1)
+    mom2 = np.stack([np.bincount(mp, weights=mom[:, k], minlength=K2 + 1) for k in range(mom.shape[1])], 1)
     u2, v2 = mp[u], mp[v]
     keep = u2 != v2
     u2, v2, c2, j2 = u2[keep], v2[keep], c[keep], js[keep]
     lo, hi = np.minimum(u2, v2), np.maximum(u2, v2)
     ukey, inv = np.unique(lo * (K2 + 1) + hi, return_inverse=True)
     return (K2, ukey // (K2 + 1), ukey % (K2 + 1), np.bincount(inv, weights=c2, minlength=ukey.size),
-            np.bincount(inv, weights=j2, minlength=ukey.size), cnt2, sums2, mp)
+            np.bincount(inv, weights=j2, minlength=ukey.size), cnt2, sums2, mom2, mp)
 
 
-def _hac(K, u, v, c, js, cnt, sums, thr, min_contact, jump_thr):
+def _hac(K, u, v, c, js, cnt, sums, mom, thr, min_contact, jump_thr, max_px=0, min_compact=0, compact_min_px=0):
     """Иерархическое слияние (центроидная связь) на графе: всегда сливается самая близкая пара с d < thr,
-    общей границей >= min_contact px и средним скачком на границе < jump_thr. Средние пересчитываются."""
+    общей границей >= min_contact px и средним скачком на границе < jump_thr. Средние пересчитываются.
+    Ограничения против «цепного» слияния: объединённый регион не больше max_px и (если он ≥ compact_min_px)
+    не менее компактен, чем min_compact (см. _compact_ratio)."""
     import heapq
     jt = jump_thr if jump_thr else np.inf
     mean = sums / np.maximum(cnt[:, None], 1)
@@ -115,7 +144,7 @@ def _hac(K, u, v, c, js, cnt, sums, thr, min_contact, jump_thr):
     ver = [0] * (K + 1)
     alive = [True] * (K + 1)
     parent = list(range(K + 1))
-    cnt = cnt.copy(); sums = sums.copy()
+    cnt = cnt.copy(); sums = sums.copy(); mom = mom.copy()
     heap = [(float(d), int(a), int(b), 0, 0) for d, a, b in zip(d0[ok], u[ok], v[ok])]
     heapq.heapify(heap)
     while heap:
@@ -124,10 +153,15 @@ def _hac(K, u, v, c, js, cnt, sums, thr, min_contact, jump_thr):
             break
         if not (alive[a] and alive[b]) or ver[a] != va or ver[b] != vb:
             continue
+        n_ab = cnt[a] + cnt[b]
+        if max_px and n_ab > max_px:
+            continue
+        if min_compact and n_ab >= compact_min_px and _compact_ratio(n_ab, mom[a] + mom[b]) < min_compact:
+            continue
         if cnt[a] < cnt[b]:
             a, b = b, a
         alive[b] = False; parent[b] = a
-        cnt[a] += cnt[b]; sums[a] += sums[b]; ver[a] += 1
+        cnt[a] += cnt[b]; sums[a] += sums[b]; mom[a] += mom[b]; ver[a] += 1
         for n, e in adj[b].items():
             del adj[n][b]
             if n == a:
@@ -156,14 +190,14 @@ def _hac(K, u, v, c, js, cnt, sums, thr, min_contact, jump_thr):
     return mp
 
 
-def merge_regions(lab, feats, thr, min_contact, min_px, jump_thr):
+def merge_regions(lab, feats, thr, min_contact, min_px, jump_thr, max_px=0, min_compact=0, compact_min_px=0):
     """Фаза 1: иерархическое слияние (см. _hac). Фаза 2: регионы < min_px → к самому похожему соседу."""
     lab = lab.astype(np.int32)
-    K, u, v, c, js, cnt, sums = _build_graph(lab, feats)
+    K, u, v, c, js, cnt, sums, mom = _build_graph(lab, feats)
     total = np.arange(K + 1, dtype=np.int64)
     if u.size:
-        mp = _hac(K, u, v, c, js, cnt, sums, thr, min_contact, jump_thr)
-        K, u, v, c, js, cnt, sums, mp = _contract(K, u, v, c, js, cnt, sums, mp)
+        mp = _hac(K, u, v, c, js, cnt, sums, mom, thr, min_contact, jump_thr, max_px, min_compact, compact_min_px)
+        K, u, v, c, js, cnt, sums, mom, mp = _contract(K, u, v, c, js, cnt, sums, mom, mp)
         total = mp[total]
     for _ in range(30):
         if u.size == 0:
@@ -191,7 +225,7 @@ def merge_regions(lab, feats, thr, min_contact, min_px, jump_thr):
         mp[nodes[mutual]] = nodes[mutual]
         for _ in range(8):
             mp = mp[mp]
-        K, u, v, c, js, cnt, sums, mp = _contract(K, u, v, c, js, cnt, sums, mp)
+        K, u, v, c, js, cnt, sums, mom, mp = _contract(K, u, v, c, js, cnt, sums, mom, mp)
         total = mp[total]
     total[0] = 0
     return total.astype(np.int32)[lab]
@@ -258,13 +292,15 @@ def segment_regions(feats, valid, crop=None, wcmap=None):
     lab = lab.astype(np.int32)
     lab[~seg_valid] = 0
     lab = cc_label(lab, connectivity=1, background=0).astype(np.int32)   # половинки суперпикселя за барьером — разные регионы
-    lab = merge_regions(lab, f, MERGE_THR, MIN_CONTACT, MIN_REGION_PX, JUMP_THR)
+    max_px = int(MAX_REGION_HA / px_area_ha) if MAX_REGION_HA else 0
+    cmin_px = int(COMPACT_MIN_HA / px_area_ha) if COMPACT_MIN_HA else 0
+    lab = merge_regions(lab, f, MERGE_THR, MIN_CONTACT, MIN_REGION_PX, JUMP_THR, max_px, MIN_COMPACT, cmin_px)
     if RELAX_ITERS > 0:
         lab = relax_labels(lab, prep(RELAX_SIGMA), RELAX_ITERS, RELAX_BETA)
     return _compact(lab), barrier
 
 # %% 5_vector_funcs
-STAT_COLS = ['n_px', 'crop_px', 's0', 's1', 's2']
+STAT_COLS = ['n_px', 'crop_px', 's0', 's1', 's2', 'sx', 'sy', 'sxx', 'syy', 'sxy']
 
 
 def extract_polygons(lab, feats, crop, halo_off, core, region, tile_id):
@@ -285,21 +321,25 @@ def extract_polygons(lab, feats, crop, halo_off, core, region, tile_id):
     if not ok.any():
         return None
     s = [np.bincount(flat, weights=fc[..., k].ravel().astype(np.float64), minlength=n.size) for k in range(3)]
+    mom = _moments(flat, cc.shape, n.size - 1, x0=c0 - X0, y0=r0 - Y0)      # координаты относительно начала области (точность float64)
     geoms, vals = [], []
     for g, v in rio_shapes(cc.astype(np.int32), mask=ok[cc], transform=Affine(1, 0, c0, 0, 1, r0), connectivity=4):
         geoms.append(shp_shape(g)); vals.append(int(v))
     vals = np.array(vals)
     gdf = gpd.GeoDataFrame({'tile_id': tile_id, 'n_px': n[vals], 'crop_px': cr[vals],
-                            's0': s[0][vals], 's1': s[1][vals], 's2': s[2][vals]}, geometry=geoms, crs=None)
+                            's0': s[0][vals], 's1': s[1][vals], 's2': s[2][vals],
+                            'sx': mom[vals, 0], 'sy': mom[vals, 1], 'sxx': mom[vals, 2], 'syy': mom[vals, 3], 'sxy': mom[vals, 4]},
+                           geometry=geoms, crs=None)
     b = shapely.bounds(np.array(geoms, dtype=object))
     gdf['seam'] = ((b[:, 0] <= c0) & (c0 > X0)) | ((b[:, 2] >= c1) & (c1 < X1)) | \
                   ((b[:, 1] <= r0) & (r0 > Y0)) | ((b[:, 3] >= r1) & (r1 < Y1))
     return gdf
 
 
-def merge_across_seams(gdf, thr, min_shared):
-    """Склеивает фрагменты, разрезанные границей тайла: соседи из разных тайлов с общей границей >= min_shared px
-    и близкими средними (< thr)."""
+def merge_across_seams_legacy(gdf, thr, min_shared):
+    """[v3] Склеивает фрагменты, разрезанные границей тайла: соседи из разных тайлов с общей границей >= min_shared px
+    и близкими средними (< thr). Без проверки резкости границы и размера: транзитивное замыкание по швам сливает соседние
+    поля одного тона в гигантский регион (на сцене TAT — 38 тыс. га). Оставлено для сравнения (SEAM_CONSTRAIN=False)."""
     gdf = gdf.reset_index(drop=True)
     idx = np.flatnonzero(gdf['seam'].values)
     if idx.size < 2:
@@ -383,6 +423,81 @@ def finalize(gdf, T, crs, px_area_ha, min_field_ha, simplify_px, min_width_px=0,
     else:
         out['area_ha'] = (out.to_crs('EPSG:6933').geometry.area / 1e4).round(3)
     return out
+
+
+def merge_across_seams(gdf, thr, min_shared, jump_fn=None, jump_thr=0, max_px=0, min_compact=0, compact_min_px=0):
+    """Склейка фрагментов через швы тайлов с теми же правилами, что и слияние внутри тайла:
+    близость средних (по АГРЕГИРОВАННЫМ средним — без дрейфа цепочки), резкость границы на шве (jump_fn(geomsA, geomsB) →
+    средний скачок значений между пикселями по обе стороны шва; ≥ jump_thr — не сливать), размер ≤ max_px и компактность
+    ≥ min_compact. Пары обрабатываются жадно по возрастанию расстояния (union-find)."""
+    gdf = gdf.reset_index(drop=True)
+    idx = np.flatnonzero(gdf['seam'].values)
+    if idx.size < 2:
+        return gdf
+    geoms = gdf.geometry.values
+    sg = geoms[idx]
+    qi, ti = STRtree(sg).query(sg, predicate='intersects')
+    m = qi < ti
+    A, B = idx[qi[m]], idx[ti[m]]
+    tid = gdf['tile_id'].values
+    d_tile = tid[A] != tid[B]
+    A, B = A[d_tile], B[d_tile]
+    if A.size == 0:
+        return gdf
+    shared = shapely.length(shapely.intersection(geoms[A], geoms[B]))
+    n_px = gdf['n_px'].values.astype(np.float64)
+    S = gdf[['s0', 's1', 's2']].values.astype(np.float64)
+    mean = S / n_px[:, None]
+    dist = np.linalg.norm(mean[A] - mean[B], axis=1)
+    ok = (shared >= min_shared) & (dist < thr)
+    A, B, dist = A[ok], B[ok], dist[ok]
+    if A.size == 0:
+        return gdf
+    if jump_fn is not None and jump_thr:
+        jmp = jump_fn(geoms[A], geoms[B])
+        keep = ~(jmp >= jump_thr)                          # nan (не удалось посчитать) — не блокирует
+        A, B, dist = A[keep], B[keep], dist[keep]
+        if A.size == 0:
+            return gdf
+    n = len(gdf)
+    parent = np.arange(n)
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    agg_n, agg_s = n_px.copy(), S.copy()
+    agg_m = gdf[['sx', 'sy', 'sxx', 'syy', 'sxy']].values.astype(np.float64).copy()
+    for k in np.argsort(dist, kind='stable'):
+        ra, rb = find(A[k]), find(B[k])
+        if ra == rb:
+            continue
+        nn = agg_n[ra] + agg_n[rb]
+        if max_px and nn > max_px:
+            continue
+        if np.linalg.norm(agg_s[ra] / agg_n[ra] - agg_s[rb] / agg_n[rb]) >= thr:
+            continue
+        if min_compact and nn >= compact_min_px and _compact_ratio(nn, agg_m[ra] + agg_m[rb]) < min_compact:
+            continue
+        parent[rb] = ra
+        agg_n[ra] = nn; agg_s[ra] += agg_s[rb]; agg_m[ra] += agg_m[rb]
+    comp = np.array([find(i) for i in range(n)])
+    sizes = np.bincount(comp, minlength=n)
+    multi = sizes[comp] > 1
+    if not multi.any():
+        return gdf
+    keep_df = gdf[~multi]
+    sub = gdf[multi].copy()
+    sub['comp'] = comp[multi]
+    agg = sub.groupby('comp')[STAT_COLS].sum()
+    ug = sub.groupby('comp')['geometry'].apply(lambda s_: shapely.union_all(s_.values))
+    merged = gpd.GeoDataFrame(agg, geometry=ug.reindex(agg.index).values, crs=None)
+    merged['tile_id'] = -1
+    merged['seam'] = False
+    out = pd.concat([keep_df, merged.reset_index(drop=True)], ignore_index=True)
+    return gpd.GeoDataFrame(out, geometry='geometry', crs=None)
 
 # %% 10_refine_funcs
 _ORIGIN = 20037508.342789244
@@ -544,4 +659,3 @@ def refine_fields(gdf, get_rgb, res=1.0, block_px=2000, margin_px=60, passes=Non
     res_gdf['refined'] = refined
     log(f'уточнено полигонов: {int(refined.sum())} из {len(geoms)}; блоков без подложки: {failed}')
     return res_gdf
-

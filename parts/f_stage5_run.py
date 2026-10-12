@@ -1,6 +1,7 @@
 
 # %% 15_stage5_refine
-if STAGES[5]:
+def do_stage5():
+    global FIELDS, WORK_CRS
     f0 = get_input(5)
     crs0 = f0.crs
     if crs0.is_projected:
@@ -41,33 +42,44 @@ if STAGES[5]:
             g_.cx[cxm - half:cxm + half, cym - half:cym + half].boundary.plot(ax=ax, color='yellow', linewidth=0.8)
             ax.set_title(ttl); ax.set_axis_off()
         plt.tight_layout(); plt.savefig(f'{OUT_DIR}/refine_before_after.png', dpi=80); plt.show()
-else:
-    print('Этап 5 пропущен (STAGES[5]=0)')
+    return FIELDS
+
+
+STAGE_FUNCS[5] = do_stage5
+if not COMPARE:
+    do_stage5() if STAGES[5] else print('Этап 5 пропущен (STAGES[5]=0)')
 
 # %% 16_stage6_after_refine
 # Классификация после уточнения границ (этап 5) — отдельный проход по полям. Если этапы 4 и 6 уже выполнены одним проходом
-# (FUSE_4_6), здесь ничего не делается. Если этап 4 выключен, а 6 включён — классификация идёт только здесь.
-if STAGES[6] and not FUSE_4_6:
-    _, cl, _, SPLIT = field_pass(get_input(6), spots=False, classify=True)
+# (fused_4_6), здесь ничего не делается. Если этап 4 выключен, а 6 включён — классификация идёт только здесь.
+def do_stage6():
+    global FIELDS
+    if fused_4_6():
+        return FIELDS
+    _, cl, _, split = field_pass(get_input(6), spots=False, classify=True)
     FIELDS = cl
-    save_class_outputs(cl, SPLIT)
-elif not STAGES[6]:
-    print('Этап 6 пропущен (STAGES[6]=0)')
+    save_class_outputs(cl, split)
+    return FIELDS
+
+
+STAGE_FUNCS[6] = do_stage6
+if not COMPARE:
+    do_stage6() if STAGES[6] else print('Этап 6 пропущен (STAGES[6]=0)')
 
 # %% 17_final
-if FIELDS is not None:
-    final_path = Path(OUT_DIR) / f'fields_final_{RUN_MODE}.gpkg'
+def final_outputs(overview=True):
+    """Итог: fields_final_<режим><метка>.gpkg (слой fields; fields_split — разбивка по классам; spots — пятна) + картинка обзора."""
+    final_path = Path(OUT_DIR) / f'fields_final_{RUN_MODE}{TAG}.gpkg'
     FIELDS.to_file(final_path, driver='GPKG', layer='fields')
+    if CLASS_SPLIT is not None:
+        CLASS_SPLIT.to_file(final_path, driver='GPKG', layer='fields_split')
+    if SPOTS_LAYER is not None and len(SPOTS_LAYER):
+        SPOTS_LAYER.to_file(final_path, driver='GPKG', layer='spots')
     print('итог:', final_path, '|', len(FIELDS), 'полей |', FIELDS.kind.value_counts().to_dict() if 'kind' in FIELDS.columns else '')
-    fig, ax = plt.subplots(figsize=(10, 10))
-    win = compare_window(1800)
-    rgb = np.clip(np.moveaxis(src.read([1, 2, 3], window=win, out_shape=(3, 1200, 1200)), 0, -1) / 255., 0, 1)
-    wt_ = rasterio.windows.transform(win, T)
-    xa, ya = wt_ * (0, 0); xb, yb = wt_ * (win.width, win.height)
-    ax.imshow(rgb, extent=(xa, xb, yb, ya))
-    colors = {'main': 'yellow', 'small': 'cyan', 'yellow': 'orange', 'input': 'white'}
-    for k_, c_ in colors.items():
-        s_ = FIELDS[FIELDS.kind == k_] if 'kind' in FIELDS.columns else FIELDS.iloc[0:0]
-        if len(s_):
-            s_.cx[min(xa, xb):max(xa, xb), min(ya, yb):max(ya, yb)].boundary.plot(ax=ax, color=c_, linewidth=0.8, label=k_)
-    ax.legend(); ax.set_axis_off(); plt.tight_layout(); plt.savefig(Path(OUT_DIR) / f'overview_{RUN_MODE}.png', dpi=80); plt.show()
+    if overview:
+        win = compare_window(1800)
+        plot_compare({'итог': FIELDS}, win=win, cols=1, panel_px=1200, path=Path(OUT_DIR) / f'overview_{RUN_MODE}{TAG}.png', color_by_class=True)
+
+
+if not COMPARE and FIELDS is not None:
+    final_outputs()

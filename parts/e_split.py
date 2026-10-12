@@ -157,8 +157,13 @@ def _shapes_px(lab):
         yield g_, v
 
 
-if STAGES['1b']:
-    FIELDS = renumber(split_fields(get_input('1b'))[0])
+def do_stage1b():
+    global FIELDS
+    FIELDS = renumber(split_fields(get_input('1b'), SPLIT_OVER)[0])      # SPLIT_OVER — перекрытия SPLIT из пресета
     save_stage('1b', FIELDS)
-else:
-    print('Этап 1б (разбивка) пропущен (STAGES["1b"]=0)')
+    return FIELDS
+
+
+STAGE_FUNCS['1b'] = do_stage1b
+if not COMPARE:
+    do_stage1b() if STAGES['1b'] else print('Этап 1б (разбивка) пропущен (STAGES["1b"]=0)')
