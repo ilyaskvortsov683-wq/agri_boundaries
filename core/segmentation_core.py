@@ -23,6 +23,9 @@ from scipy.sparse.csgraph import connected_components
 from skimage.segmentation import slic, watershed
 from skimage.filters import sobel
 from skimage.measure import label as cc_label
+from skimage.morphology import skeletonize
+from skimage.filters import apply_hysteresis_threshold
+from scipy.signal import fftconvolve
 from tqdm.auto import tqdm
 
 # %% 4_segmentation_funcs
@@ -85,6 +88,72 @@ def _compact_ratio(n, m):
     vxx, vyy, vxy = m[2] / n - mx * mx + 1 / 12, m[3] / n - my * my + 1 / 12, m[4] / n - mx * my
     det = vxx * vyy - vxy * vxy
     return n / np.sqrt(det) if det > 1e-9 else np.inf
+
+
+_SPLIT_K = {}
+_SPLIT_BASE = dict(E_MIN=6.3, R_MIN=3.15, E_MAX=9.1)   # пороги отклика при SENS=1 (в единицах NDVI 0–255); SENS делит их
+
+
+def _line_kernel(theta, s_across, s_along, kind):
+    key = (round(float(theta), 4), s_across, s_along, kind)
+    if key not in _SPLIT_K:
+        r = int(3 * max(s_across, s_along)) + 1
+        y, x = np.mgrid[-r:r + 1, -r:r + 1].astype(np.float32)
+        u = x * np.cos(theta) + y * np.sin(theta)                 # поперёк линии
+        v = -x * np.sin(theta) + y * np.cos(theta)                # вдоль линии
+        gk = np.exp(-u ** 2 / (2 * s_across ** 2) - v ** 2 / (2 * s_along ** 2))
+        k = (-u / s_across ** 2 * gk) if kind == 'edge' else ((1 - u ** 2 / s_across ** 2) * gk)
+        if kind == 'ridge':
+            k = k - k.mean()
+        _SPLIT_K[key] = (k / np.abs(k).sum()).astype(np.float32)
+    return _SPLIT_K[key]
+
+
+def _oriented(ch, kind, s_across, s_along, n=12):
+    out = np.zeros(ch.shape, np.float32)
+    for i in range(n):
+        r = fftconvolve(ch, _line_kernel(np.pi * i / n, s_across, s_along, kind), mode='same')
+        np.maximum(out, np.abs(r) if kind == 'edge' else r, out=out)
+    return out
+
+
+def _line_resp(feats, sens, s_along):
+    s = np.stack([gaussian_filter(feats[..., k], 0.7) for k in range(2)], -1).astype(np.float32)
+    mx, mn = s[..., 0], s[..., 1]
+    b = _SPLIT_BASE
+    return np.maximum.reduce([_oriented(mn, 'edge', 1.3, s_along) * sens / b['E_MIN'],
+                              _oriented(mn, 'ridge', 1.3, s_along) * sens / b['R_MIN'],
+                              _oriented(mx, 'edge', 1.3, s_along) * sens / b['E_MAX']])
+
+
+def split_line_response(feats, sens, s_along, block=2500, halo=24):
+    """Нормированный отклик «линия/ступенька» (≥ 1 — уверенная линия). Каналы: min (ступенька и тонкая линия), max (ступенька).
+    Окна больше block×block считаются блоками с перекрытием (экономия памяти для полигонов-гигантов)."""
+    h, w = feats.shape[:2]
+    if h * w <= 1.5 * block * block:
+        return _line_resp(feats, sens, s_along)
+    R = np.zeros((h, w), np.float32)
+    for r0 in range(0, h, block):
+        for c0 in range(0, w, block):
+            ra, rb, ca, cb = max(r0 - halo, 0), min(r0 + block + halo, h), max(c0 - halo, 0), min(c0 + block + halo, w)
+            Rb = _line_resp(feats[ra:rb, ca:cb], sens, s_along)
+            R[r0:r0 + block, c0:c0 + block] = Rb[r0 - ra:r0 - ra + min(block, h - r0), c0 - ca:c0 - ca + min(block, w - c0)]
+    return R
+
+
+def detect_line_barriers(feats, valid, sens, s_along, min_px, edge_px=0):
+    """Длинные прямые тонкие линии и ступеньки тона (межи, дороги, слабые лесополосы, границы соседних культур).
+    Ориентированные фильтры усредняют ВДОЛЬ линии, поэтому ловят линии, невидимые для слияния по средним (скачок < JUMP_THR).
+    Результат: скелет линий (1 px) длиной ≥ min_px. Операция локальна: не зависит от разбиения на тайлы (при достаточном HALO)."""
+    R = split_line_response(feats, sens, s_along)
+    R = np.where(valid, R, 0)
+    cand = apply_hysteresis_threshold(R, 0.6, 1.0)
+    lab, n = ndi_label(skeletonize(cand), structure=np.ones((3, 3)))
+    if n == 0:
+        return np.zeros(valid.shape, bool)
+    keep = np.bincount(lab.ravel(), minlength=n + 1) >= min_px
+    keep[0] = False
+    return keep[lab]
 
 
 def _build_graph(lab, feats):
@@ -274,7 +343,13 @@ def segment_regions(feats, valid, crop=None, wcmap=None):
     SLIC без параметра mask (с ним в ~30 раз медленнее): невалидное заполняется нулём и обнуляется после."""
     barrier = detect_barriers(feats, valid, wcmap) if (BARRIER_THR or len(BARRIER_WC_CLASSES)) \
         else np.zeros(valid.shape, bool)
-    seg_valid = valid & ~barrier
+    line_b = np.zeros(valid.shape, bool)
+    if LINE_SENS:
+        line_b = detect_line_barriers(feats, valid, LINE_SENS, LINE_SIGMA_ALONG, LINE_MIN_PX)
+        if LINE_DIL > 0 and line_b.any():
+            line_b = binary_dilation(line_b, structure=np.ones((3, 3), bool), iterations=int(LINE_DIL))
+        line_b &= valid & ~barrier                  # там, где уже барьер-лесополоса, линия не нужна
+    seg_valid = valid & ~barrier & ~line_b
     extra = None
     if USE_WC_IN_SEGMENTATION and crop is not None:
         extra = (crop.astype(np.float32) * 255 * WC_WEIGHT)[..., None]
@@ -297,6 +372,9 @@ def segment_regions(feats, valid, crop=None, wcmap=None):
     lab = merge_regions(lab, f, MERGE_THR, MIN_CONTACT, MIN_REGION_PX, JUMP_THR, max_px, MIN_COMPACT, cmin_px)
     if RELAX_ITERS > 0:
         lab = relax_labels(lab, prep(RELAX_SIGMA), RELAX_ITERS, RELAX_BETA)
+    if line_b.any() and LINE_FILL:                  # пиксели линий-границ достаются ближайшему региону: соседние поля соприкасаются по линии без зазора
+        idx = distance_transform_edt(lab == 0, return_distances=False, return_indices=True)
+        lab = np.where(line_b & (lab == 0), lab[idx[0], idx[1]], lab)
     return _compact(lab), barrier
 
 # %% 5_vector_funcs

@@ -59,6 +59,9 @@ from scipy.sparse.csgraph import connected_components
 from skimage.segmentation import slic, watershed
 from skimage.filters import sobel
 from skimage.measure import label as cc_label
+from skimage.morphology import skeletonize
+from skimage.filters import apply_hysteresis_threshold
+from scipy.signal import fftconvolve
 from tqdm.auto import tqdm
 
 from scipy.ndimage import uniform_filter
@@ -104,6 +107,8 @@ AGRI_CLASSES  = [40]                    # Cropland
 
 # ───────────── Тон «жёлтого» (общий для этапов 1, 3, 4, 6) ─────────────
 YELLOW_MIN_THR = 85         # средний min-канал региона выше порога → «жёлтое» (многолетняя растительность); розовые/тёмные ≤ ~60
+REGULARIZE_TOL_M = 18       # финальное выпрямление границ: допуск упрощения (м) с общей топологией соседних полей (0 — выкл.); эталонные поля ≈ 10 вершин/км
+CROP_POLY_MIN  = 0.5        # ГОТОВЫЙ полигон любого типа (основные, мелкие, жёлтые) должен быть не менее чем на эту долю пашней WorldCover (0 — выкл.)
 
 # ───────────── Этап 1: основные поля ─────────────
 BASE = dict(
@@ -127,33 +132,40 @@ BASE = dict(
     RELAX_SIGMA=1.0,
     RELAX_BETA=250,        # штраф Потса: больше → глаже границы
     # векторизация и отбор
-    MIN_FIELD_HA=15.5, FILL_HOLES_HA=10.0, SIMPLIFY_PX=0.8, MIN_WIDTH_PX=4,
+    MIN_FIELD_HA=15.5, FILL_HOLES_HA=10.0, SIMPLIFY_PX=2.0, MIN_WIDTH_PX=4,
     CROP_FRAC_MIN=0.4,     # доля cropland WorldCover в регионе для признания полем
     # ограничения против гигантских «матричных» регионов (v5): слияние не должно создавать регион, который …
     MAX_REGION_HA=800,     # … крупнее этой площади (0 — выкл.); типичное поле Самарской обл. 50–300 га
+    SEAM_MAX_REGION_HA=2500, # потолок площади для склейки через шов тайла (там уже проверена резкость границы; настоящие поля бывают > 1000 га)
     MIN_COMPACT=6.5,       # … «рыхлее» этого порога компактности C = n/√detΣ (прямоугольник/круг ≈ 12, цепочка полей ≪ 8; 0 — выкл.)
     COMPACT_MIN_HA=30,     # компактность проверяется только у регионов крупнее этой площади
     SEAM_CONSTRAIN=True,   # склейка через швы тайлов: с проверкой резкости границы (JUMP_THR), размера и компактности; False — как в v3
     WC_BARRIER_MIN_PX=30,  # BARRIER_WC_CLASSES: компоненты WorldCover мельче этого размера (px) игнорируются (шум)
+    # длинные прямые линии/ступеньки тона как барьеры ДО слияния (v6; ловят слабые границы между соседними полями)
+    LINE_SENS=0.45,        # чувствительность (0 — выкл.): больше → ловит более слабые линии (≥1 — пересегментация текстуры)
+    LINE_MIN_PX=40,        # линии короче (px) игнорируются (1 px ≈ 6×10 м)
+    LINE_SIGMA_ALONG=4,    # длина усреднения вдоль линии; больше → только прямые длинные линии
+    LINE_DIL=1,            # утолщение линии-барьера, px (закрывает разрывы)
+    LINE_FILL=True,        # пиксели линий отдаются ближайшему региону (поля соприкасаются по линии)
 )
 
 PRESETS = {
-    # ── семейство C: v3-база + ограничения размера/компактности/швов (главное исправление) ──
-    'C_base':     dict(),                                       # = BASE
-    'C_cap400':   dict(MAX_REGION_HA=400),                      # жёстче по размеру региона
-    'C_wc':       dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0),   # леса/застройка/вода/болота — барьеры; сёла внутри поля не заливать
-    'C_sharp':    dict(MERGE_THR=40, JUMP_THR=10, BARRIER_THR=22, RELAX_SIGMA=0.8, RELAX_BETA=400),   # чувствительнее к границам между одинаковыми полями
-    'C_sharp_wc': dict(MERGE_THR=40, JUMP_THR=10, BARRIER_THR=22, RELAX_SIGMA=0.8, RELAX_BETA=400,
-                       BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0),
-    'C_smooth':   dict(SMOOTH_SIGMA=1.2, SP_SIZE_PX=160, MIN_REGION_PX=150, SIMPLIFY_PX=1.0, RELAX_BETA=600, BARRIER_THR=22),   # глаже границы
-    'C_fine':     dict(SP_SIZE_PX=70, MIN_REGION_PX=60, JUMP_THR=12, MIN_FIELD_HA=10),                # мельче суперпиксели: больше мелких деталей
-    'C_split_soft': dict(SPLIT=dict(SENS=0.7, MIN_HA=120)),     # этап 1b мягче: режет только явные линии у крупных полигонов
-    'C_nosplit':  dict(NO_STAGES=['1b']),                       # без этапа 1b
-    # ── v3 для сравнения (даёт гигант ~38 тыс. га на сцене TAT; в сравнении по умолчанию не участвует) ──
-    'OLD_A_best': dict(MAX_REGION_HA=0, MIN_COMPACT=0, SEAM_CONSTRAIN=False),
+    # ── семейство L (v6): линии как барьеры до слияния + ограничения размера/компактности/швов ──
+    'L_base':     dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0),          # основной кандидат: леса/застройка/вода — барьеры; сёла не заливать
+    'L_soft':     dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0, LINE_SENS=0.35),   # только явные линии
+    'L_strong':   dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0, LINE_SENS=0.6),    # больше слабых линий (больше мелких кусков)
+    'L_long':     dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0, LINE_SIGMA_ALONG=8, LINE_MIN_PX=60),   # только длинные прямые линии
+    'L_nowc':     dict(),                                                                   # без WorldCover-барьеров
+    'L_cap400':   dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0, MAX_REGION_HA=400),
+    'L_sharp':    dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0, MERGE_THR=40, JUMP_THR=10, BARRIER_THR=22),
+    'L_smooth':   dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0, SMOOTH_SIGMA=1.2, RELAX_BETA=600, SIMPLIFY_PX=3.0),   # глаже границы
+    'L_split_off': dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0, NO_STAGES=['1b']),        # без этапа 1b
+    # ── v5 и v3 для сравнения (в сравнении по умолчанию не участвуют) ──
+    'OLD_C_base': dict(LINE_SENS=0, SIMPLIFY_PX=0.8),
+    'OLD_A_best': dict(LINE_SENS=0, SIMPLIFY_PX=0.8, MAX_REGION_HA=0, MIN_COMPACT=0, SEAM_CONSTRAIN=False),
 }
 
-STAGE1_PRESET   = 'C_base'         # что использовать
+STAGE1_PRESET   = 'L_base'         # что использовать
 COMPARE_PRESETS = True               # True (+ RUN_MODE='test'): каждый пресет проходит ВСЕ включённые этапы; сохраняются слой после этапа 1 и финал
 COMPARE_NAMES   = None               # какие пресеты сравнивать: список имён; None — все, кроме начинающихся с 'OLD'
 COMPARE_CENTERS = [(0.5, 0.5)]       # центры окон для картинок сравнения (доли области по x, y); на каждый — отдельный PNG
@@ -231,8 +243,9 @@ REFINE_MAX_TILES  = 20000
 # Правила по сглаженным каналам пикселя (0–255). Порядок: неиспользуемое → пар → засеянное.
 CLASS_MODE        = 'rules'   # 'rules' — пороги ниже; 'tree' — дерево решений, обученное на ваших размеченных полях (CLASS_TRAIN_*)
 CLASS_NAMES       = {1: 'засеянное', 2: 'пар', 3: 'неиспользуемое'}
-UNUSED_MIN_THR    = 85        # min ≥ порога → растительность не спадает весь сезон (залежь/травостой/кустарник)
-FALLOW_MAX_THR    = 150       # max < порога → за сезон растительность не развилась (чистый пар / голая почва)
+UNUSED_MIN_THR    = 75        # min ≥ порога → растительность не спадает весь сезон (залежь/травостой/кустарник)
+FALLOW_MAX_THR    = 170       # max < порога → за сезон растительность не развилась (чистый пар / голая почва)
+UNUSED_DIFF_MAX   = 130       # diff < порога (при max ≥ FALLOW_MAX_THR) → тоже «неиспользуемое»: слабый размах NDVI за сезон (0 — выкл.)
 FALLOW_MIN_FIELD_HA = 15.5    # поля меньше этой площади паром не бывают: пиксели «пар» в них считаются засеянными
 CLASS_SIGMA       = 1.0       # сглаживание каналов перед правилами
 CLASS_SMOOTH_WIN  = 5         # мажоритарное окно 5 или 7 (0 — выкл.)
@@ -241,6 +254,8 @@ SPLIT_BY_CLASS    = True      # слой с разбивкой поля по г�
 SPLIT_MIN_HA      = 2.0       # куски разбивки мельче поглощаются соседним классом
 CLASS_TRAIN_LAYER = None      # для 'tree': GeoJSON/GPKG с размеченными полями
 CLASS_TRAIN_COL   = None      # колонка с классом (значения — любые метки)
+# Пороги выше подобраны по размеченным полям Донбасса (hold-out: залежь 41 % → 75–82 %, пар 81 % → 91 % при той же общей точности).
+# Для Самарской области раньше были 150 / 85 / 0 — вернуть: FALLOW_MAX_THR, UNUSED_MIN_THR, UNUSED_DIFF_MAX = 150, 85, 0
 
 # %% 4_segmentation_funcs
 def smooth_feats(feats, sigma):
@@ -302,6 +317,72 @@ def _compact_ratio(n, m):
     vxx, vyy, vxy = m[2] / n - mx * mx + 1 / 12, m[3] / n - my * my + 1 / 12, m[4] / n - mx * my
     det = vxx * vyy - vxy * vxy
     return n / np.sqrt(det) if det > 1e-9 else np.inf
+
+
+_SPLIT_K = {}
+_SPLIT_BASE = dict(E_MIN=6.3, R_MIN=3.15, E_MAX=9.1)   # пороги отклика при SENS=1 (в единицах NDVI 0–255); SENS делит их
+
+
+def _line_kernel(theta, s_across, s_along, kind):
+    key = (round(float(theta), 4), s_across, s_along, kind)
+    if key not in _SPLIT_K:
+        r = int(3 * max(s_across, s_along)) + 1
+        y, x = np.mgrid[-r:r + 1, -r:r + 1].astype(np.float32)
+        u = x * np.cos(theta) + y * np.sin(theta)                 # поперёк линии
+        v = -x * np.sin(theta) + y * np.cos(theta)                # вдоль линии
+        gk = np.exp(-u ** 2 / (2 * s_across ** 2) - v ** 2 / (2 * s_along ** 2))
+        k = (-u / s_across ** 2 * gk) if kind == 'edge' else ((1 - u ** 2 / s_across ** 2) * gk)
+        if kind == 'ridge':
+            k = k - k.mean()
+        _SPLIT_K[key] = (k / np.abs(k).sum()).astype(np.float32)
+    return _SPLIT_K[key]
+
+
+def _oriented(ch, kind, s_across, s_along, n=12):
+    out = np.zeros(ch.shape, np.float32)
+    for i in range(n):
+        r = fftconvolve(ch, _line_kernel(np.pi * i / n, s_across, s_along, kind), mode='same')
+        np.maximum(out, np.abs(r) if kind == 'edge' else r, out=out)
+    return out
+
+
+def _line_resp(feats, sens, s_along):
+    s = np.stack([gaussian_filter(feats[..., k], 0.7) for k in range(2)], -1).astype(np.float32)
+    mx, mn = s[..., 0], s[..., 1]
+    b = _SPLIT_BASE
+    return np.maximum.reduce([_oriented(mn, 'edge', 1.3, s_along) * sens / b['E_MIN'],
+                              _oriented(mn, 'ridge', 1.3, s_along) * sens / b['R_MIN'],
+                              _oriented(mx, 'edge', 1.3, s_along) * sens / b['E_MAX']])
+
+
+def split_line_response(feats, sens, s_along, block=2500, halo=24):
+    """Нормированный отклик «линия/ступенька» (≥ 1 — уверенная линия). Каналы: min (ступенька и тонкая линия), max (ступенька).
+    Окна больше block×block считаются блоками с перекрытием (экономия памяти для полигонов-гигантов)."""
+    h, w = feats.shape[:2]
+    if h * w <= 1.5 * block * block:
+        return _line_resp(feats, sens, s_along)
+    R = np.zeros((h, w), np.float32)
+    for r0 in range(0, h, block):
+        for c0 in range(0, w, block):
+            ra, rb, ca, cb = max(r0 - halo, 0), min(r0 + block + halo, h), max(c0 - halo, 0), min(c0 + block + halo, w)
+            Rb = _line_resp(feats[ra:rb, ca:cb], sens, s_along)
+            R[r0:r0 + block, c0:c0 + block] = Rb[r0 - ra:r0 - ra + min(block, h - r0), c0 - ca:c0 - ca + min(block, w - c0)]
+    return R
+
+
+def detect_line_barriers(feats, valid, sens, s_along, min_px, edge_px=0):
+    """Длинные прямые тонкие линии и ступеньки тона (межи, дороги, слабые лесополосы, границы соседних культур).
+    Ориентированные фильтры усредняют ВДОЛЬ линии, поэтому ловят линии, невидимые для слияния по средним (скачок < JUMP_THR).
+    Результат: скелет линий (1 px) длиной ≥ min_px. Операция локальна: не зависит от разбиения на тайлы (при достаточном HALO)."""
+    R = split_line_response(feats, sens, s_along)
+    R = np.where(valid, R, 0)
+    cand = apply_hysteresis_threshold(R, 0.6, 1.0)
+    lab, n = ndi_label(skeletonize(cand), structure=np.ones((3, 3)))
+    if n == 0:
+        return np.zeros(valid.shape, bool)
+    keep = np.bincount(lab.ravel(), minlength=n + 1) >= min_px
+    keep[0] = False
+    return keep[lab]
 
 
 def _build_graph(lab, feats):
@@ -491,7 +572,13 @@ def segment_regions(feats, valid, crop=None, wcmap=None):
     SLIC без параметра mask (с ним в ~30 раз медленнее): невалидное заполняется нулём и обнуляется после."""
     barrier = detect_barriers(feats, valid, wcmap) if (BARRIER_THR or len(BARRIER_WC_CLASSES)) \
         else np.zeros(valid.shape, bool)
-    seg_valid = valid & ~barrier
+    line_b = np.zeros(valid.shape, bool)
+    if LINE_SENS:
+        line_b = detect_line_barriers(feats, valid, LINE_SENS, LINE_SIGMA_ALONG, LINE_MIN_PX)
+        if LINE_DIL > 0 and line_b.any():
+            line_b = binary_dilation(line_b, structure=np.ones((3, 3), bool), iterations=int(LINE_DIL))
+        line_b &= valid & ~barrier                  # там, где уже барьер-лесополоса, линия не нужна
+    seg_valid = valid & ~barrier & ~line_b
     extra = None
     if USE_WC_IN_SEGMENTATION and crop is not None:
         extra = (crop.astype(np.float32) * 255 * WC_WEIGHT)[..., None]
@@ -514,6 +601,9 @@ def segment_regions(feats, valid, crop=None, wcmap=None):
     lab = merge_regions(lab, f, MERGE_THR, MIN_CONTACT, MIN_REGION_PX, JUMP_THR, max_px, MIN_COMPACT, cmin_px)
     if RELAX_ITERS > 0:
         lab = relax_labels(lab, prep(RELAX_SIGMA), RELAX_ITERS, RELAX_BETA)
+    if line_b.any() and LINE_FILL:                  # пиксели линий-границ достаются ближайшему региону: соседние поля соприкасаются по линии без зазора
+        idx = distance_transform_edt(lab == 0, return_distances=False, return_indices=True)
+        lab = np.where(line_b & (lab == 0), lab[idx[0], idx[1]], lab)
     return _compact(lab), barrier
 
 # %% 5_vector_funcs
@@ -873,6 +963,44 @@ def get_input(k):
     raise RuntimeError(f'Этап {k}: нет входных полей. Включите этап 1 (и промежуточные) или задайте IN_LAYERS[{k!r}].')
 
 
+def regularize_boundaries(gdf, tol_m=None):
+    """Выпрямление границ с сохранением общей топологии: границы всех полигонов разбиваются на дуги между узлами
+    (там, где сходятся ≥3 границ), каждая дуга упрощается Дугласом–Пекером с допуском tol_m (метры, проекция UTM),
+    полигоны собираются заново (polygonize) и получают атрибуты исходных. Общая граница двух полей остаётся общей.
+    Площадь и IoU почти не меняются; эталонная цифровка ≈ 10 вершин/км и ~2/3 периметра в прямых отрезках ≥ 150 м."""
+    tol_m = REGULARIZE_TOL_M if tol_m is None else tol_m
+    if gdf is None or len(gdf) == 0 or not tol_m:
+        return gdf
+    from shapely.ops import polygonize
+    c = gdf.to_crs(4326).total_bounds
+    utm = f'EPSG:{32600 + int(((c[0] + c[2]) / 2 + 180) // 6) + 1}' if not CRS.is_projected else CRS
+    g6 = gdf.reset_index(drop=True).to_crs(utm)
+    geoms = shapely.make_valid(g6.geometry.values)
+    geoms = np.array([x if x.geom_type in ('Polygon', 'MultiPolygon') else
+                      shapely.union_all([q for q in shapely.get_parts(x) if q.geom_type in ('Polygon', 'MultiPolygon')]) for x in geoms], dtype=object)
+    try:
+        lines = shapely.line_merge(shapely.union_all(shapely.boundary(geoms)))
+        simp = list(shapely.get_parts(lines.simplify(tol_m, preserve_topology=True)))     # все дуги вместе: пересечений между ними не возникает
+        faces = list(polygonize(simp))
+        tree = shapely.STRtree(geoms)
+        rep = shapely.point_on_surface(np.array(faces, dtype=object))
+        owner = {}
+        for f, pt in zip(faces, rep):
+            hit = [k for k in tree.query(pt, predicate='within')]
+            if hit:
+                owner.setdefault(int(hit[0]), []).append(f)
+        out_geoms = [shapely.union_all(owner[k]) if k in owner else geoms[k] for k in range(len(geoms))]
+    except Exception as e:
+        print('  регуляризация: topo-упрощение не удалось, упрощение по полигонам:', str(e)[:80])
+        out_geoms = [x.simplify(tol_m, preserve_topology=True) for x in geoms]
+    g6 = g6.copy(); g6['geometry'] = shapely.make_valid(np.array(out_geoms, dtype=object))
+    g6 = g6[~g6.geometry.is_empty].to_crs(gdf.crs)
+    g6['geometry'] = shapely.make_valid(g6.geometry.values)
+    g6 = g6.explode(index_parts=False).reset_index(drop=True)
+    g6 = g6[g6.geometry.geom_type == 'Polygon'].reset_index(drop=True)
+    return add_area(g6)
+
+
 def add_area(gdf):
     gdf = gdf.copy()
     gdf['area_ha'] = (gdf.to_crs('EPSG:6933').geometry.area / 1e4).round(3) if not CRS.is_projected else (gdf.geometry.area / 1e4).round(3)
@@ -1156,7 +1284,8 @@ def seg_raw(name, overrides, exclude=None):
     """Один проход по тайлам: сегментация → «сырые» регионы (все тона и размеры) → склейка швов.
     Результат кэшируется по тайлам; тайлы считаются параллельно (N_WORKERS процессов)."""
     set_params(*overrides)
-    p = {k: globals()[k] for k in BASE}
+    POST_ONLY = ('SIMPLIFY_PX', 'MIN_FIELD_HA', 'FILL_HOLES_HA', 'MIN_WIDTH_PX', 'SMOOTH_LABELS')    # влияют только на make_fields — сегментацию не пересчитывают
+    p = {k: globals()[k] for k in BASE if k not in POST_ONLY}
     p.update(TILE=TILE, HALO=HALO, REGION=REGION, AGRI=AGRI_CLASSES, WC=USE_WORLDCOVER, EX=layer_hash(exclude), V=5)
     h = hashlib.md5(json.dumps(p, sort_keys=True, default=str).encode()).hexdigest()[:8]
     tdir = Path(OUT_DIR) / f'tiles5_{RUN_MODE}_{name}_{h}'
@@ -1180,9 +1309,65 @@ def seg_raw(name, overrides, exclude=None):
     raw = gpd.GeoDataFrame(pd.concat([gpd.read_parquet(f) for f in files], ignore_index=True), geometry='geometry', crs=None)
     if not SEAM_CONSTRAIN:
         return merge_across_seams_legacy(raw, SEAM_THR, MIN_CONTACT)
-    max_px = int(MAX_REGION_HA / px_area_ha) if MAX_REGION_HA else 0
+    max_px = int(max(SEAM_MAX_REGION_HA, MAX_REGION_HA) / px_area_ha) if MAX_REGION_HA else 0
     cmin_px = int(COMPACT_MIN_HA / px_area_ha) if COMPACT_MIN_HA else 0
     return merge_across_seams(raw, SEAM_THR, MIN_CONTACT, seam_jump_fn, JUMP_THR, max_px, MIN_COMPACT, cmin_px)
+
+
+WC_REGION = None
+
+
+def wc_region():
+    """WorldCover на сетке растра для всей области (np.memmap uint8; собирается из кэша тайлов). None — без WorldCover."""
+    global WC_REGION
+    if not USE_WORLDCOVER:
+        return None
+    if WC_REGION is None:
+        path = Path(LOCAL_DIR) / f'wc_region_{RUN_MODE}_{X0}_{Y0}_{X1}_{Y1}.u8'
+        mm = np.memmap(path, dtype=np.uint8, mode='w+', shape=(Y1 - Y0, X1 - X0))
+        for tile in tiles:
+            win, t_halo, h, w, tag = tile_info(tile)
+            wc = get_wc_map(t_halo, h, w, tag)
+            c0, r0, c1, r1 = tile['core']; hc0, hr0 = tile['halo'][:2]
+            mm[r0 - Y0:r1 - Y0, c0 - X0:c1 - X0] = wc[r0 - hr0:r1 - hr0, c0 - hc0:c1 - hc0]
+        mm.flush()
+        WC_REGION = mm
+    return WC_REGION
+
+
+def polygon_crop_frac(gdf):
+    """Доля пашни (AGRI_CLASSES) WorldCover внутри каждого полигона (по пикселям растра)."""
+    mm = wc_region()
+    out = np.ones(len(gdf))
+    if mm is None:
+        return out
+    for i, g_ in enumerate(gdf.geometry.values):
+        win, _ = field_window(g_, margin=0)
+        if win is None:
+            out[i] = 0; continue
+        ca, ra = max(int(win.col_off), X0), max(int(win.row_off), Y0)
+        cb, rb = min(int(win.col_off + win.width), X1), min(int(win.row_off + win.height), Y1)
+        if cb <= ca or rb <= ra:
+            out[i] = 0; continue
+        wt = rasterio.windows.transform(Window(ca, ra, cb - ca, rb - ra), T)
+        m = rasterize([(g_, 1)], out_shape=(rb - ra, cb - ca), transform=wt, fill=0, dtype='uint8').astype(bool)
+        if m.any():
+            out[i] = float(np.isin(mm[ra - Y0:rb - Y0, ca - X0:cb - X0], AGRI_CLASSES)[m].mean())
+    return out
+
+
+def crop_filter(gdf, min_frac=None, label=''):
+    """Оставляет полигоны, на которых пашни WorldCover ≥ min_frac (по умолчанию CROP_POLY_MIN); записывает crop_wc."""
+    min_frac = CROP_POLY_MIN if min_frac is None else min_frac
+    if gdf is None or len(gdf) == 0 or not min_frac or not USE_WORLDCOVER:
+        return gdf
+    fr = polygon_crop_frac(gdf)
+    gdf = gdf.copy(); gdf['crop_wc'] = fr.round(3)
+    keep = fr >= min_frac
+    if (~keep).any():
+        by = gdf[~keep]['kind'].value_counts().to_dict() if 'kind' in gdf.columns else {}
+        print(f'  пашня WorldCover < {min_frac:.0%}: убрано {int((~keep).sum())} из {len(gdf)} {label}{by}')
+    return gdf[keep].reset_index(drop=True)
 
 
 def make_fields(merged, tone, min_ha, fill_ha, width_px, min_solidity=0.0, kind='main', crop_min=0.0, simplify_px=None):
@@ -1285,7 +1470,7 @@ def do_stage1():
                     simplify_px=s1_param('SIMPLIFY_PX'))
     if r is None or r.empty:
         raise RuntimeError('Этап 1: полей нет')
-    FIELDS = renumber(r)
+    FIELDS = renumber(crop_filter(r, label='(этап 1) '))
     save_stage(1, FIELDS)
     d = describe(FIELDS)
     print(f'  этап 1: максимум {d["max_ha"]} га, полигонов > {GIANT_HA} га: {d["n_giant"]} ({d["giant_share"]:.0%} площади)')
@@ -1302,60 +1487,7 @@ if not COMPARE:
 # и по резким ступенькам тона. Линии ищутся ориентированными фильтрами (усреднение ВДОЛЬ линии, поэтому ловятся
 # слабые линии, которые top-hat барьеры этапа 1 пропускают), затем отсеиваются по длине. Работает только внутри
 # выбранных полигонов, растр читается окнами — это дёшево и не требует повторной сегментации.
-from scipy.signal import fftconvolve
 from scipy.ndimage import binary_erosion, binary_dilation, label as ndi_label3, distance_transform_edt as _edt
-from skimage.morphology import skeletonize
-from skimage.filters import apply_hysteresis_threshold
-
-_SPLIT_K = {}
-_SPLIT_BASE = dict(E_MIN=6.3, R_MIN=3.15, E_MAX=9.1)   # пороги отклика при SENS=1 (в единицах NDVI 0–255); SENS делит их
-
-
-def _line_kernel(theta, s_across, s_along, kind):
-    key = (round(float(theta), 4), s_across, s_along, kind)
-    if key not in _SPLIT_K:
-        r = int(3 * max(s_across, s_along)) + 1
-        y, x = np.mgrid[-r:r + 1, -r:r + 1].astype(np.float32)
-        u = x * np.cos(theta) + y * np.sin(theta)                 # поперёк линии
-        v = -x * np.sin(theta) + y * np.cos(theta)                # вдоль линии
-        gk = np.exp(-u ** 2 / (2 * s_across ** 2) - v ** 2 / (2 * s_along ** 2))
-        k = (-u / s_across ** 2 * gk) if kind == 'edge' else ((1 - u ** 2 / s_across ** 2) * gk)
-        if kind == 'ridge':
-            k = k - k.mean()
-        _SPLIT_K[key] = (k / np.abs(k).sum()).astype(np.float32)
-    return _SPLIT_K[key]
-
-
-def _oriented(ch, kind, s_across, s_along, n=12):
-    out = np.zeros(ch.shape, np.float32)
-    for i in range(n):
-        r = fftconvolve(ch, _line_kernel(np.pi * i / n, s_across, s_along, kind), mode='same')
-        np.maximum(out, np.abs(r) if kind == 'edge' else r, out=out)
-    return out
-
-
-def _line_resp(feats, sens, s_along):
-    s = np.stack([gaussian_filter(feats[..., k], 0.7) for k in range(2)], -1).astype(np.float32)
-    mx, mn = s[..., 0], s[..., 1]
-    b = _SPLIT_BASE
-    return np.maximum.reduce([_oriented(mn, 'edge', 1.3, s_along) * sens / b['E_MIN'],
-                              _oriented(mn, 'ridge', 1.3, s_along) * sens / b['R_MIN'],
-                              _oriented(mx, 'edge', 1.3, s_along) * sens / b['E_MAX']])
-
-
-def split_line_response(feats, sens, s_along, block=2500, halo=24):
-    """Нормированный отклик «линия/ступенька» (≥ 1 — уверенная линия). Каналы: min (ступенька и тонкая линия), max (ступенька).
-    Окна больше block×block считаются блоками с перекрытием (экономия памяти для полигонов-гигантов)."""
-    h, w = feats.shape[:2]
-    if h * w <= 1.5 * block * block:
-        return _line_resp(feats, sens, s_along)
-    R = np.zeros((h, w), np.float32)
-    for r0 in range(0, h, block):
-        for c0 in range(0, w, block):
-            ra, rb, ca, cb = max(r0 - halo, 0), min(r0 + block + halo, h), max(c0 - halo, 0), min(c0 + block + halo, w)
-            Rb = _line_resp(feats[ra:rb, ca:cb], sens, s_along)
-            R[r0:r0 + block, c0:c0 + block] = Rb[r0 - ra:r0 - ra + min(block, h - r0), c0 - ca:c0 - ca + min(block, w - c0)]
-    return R
 
 
 def split_labels(feats, fm, P):
@@ -1482,6 +1614,7 @@ def do_stage2():
     if new is not None and len(new):
         new = subtract_existing(new, base, S2['MIN_FIELD_HA'])
         new = shape_filter(new, None, S2['MAX_HOLE_FRAC'])
+        new = crop_filter(new, label='(мелкие) ')
         new['kind'] = np.where(new.area_ha >= s1_param('MIN_FIELD_HA'), 'main', 'small')
         new = new[new.kind == 'small'] if not S2_FINE_PASS else new
         n_new = len(new)
@@ -1507,6 +1640,7 @@ def do_stage3():
     if new is not None and len(new):
         new = subtract_existing(new, base, S3['MIN_FIELD_HA'])
         new = shape_filter(new, S3['MAX_FIELD_HA'], S3['MAX_HOLE_FRAC'])
+        new = crop_filter(new, label='(жёлтые) ')
         n_new = len(new)
         base = pd.concat([base, new], ignore_index=True)
     FIELDS = renumber(resolve_nested(gpd.GeoDataFrame(base, geometry='geometry', crs=CRS)))
@@ -1599,6 +1733,8 @@ def pixel_classes(f, allow_fallow=True):
     if allow_fallow:
         cls[f[..., 0] < FALLOW_MAX_THR] = 2             # пар: растительность за сезон не развилась
     cls[f[..., 1] >= UNUSED_MIN_THR] = 3                # неиспользуемое: min NDVI не падает (травостой/залежь/кустарник)
+    if UNUSED_DIFF_MAX:                                 # … или слабый размах NDVI за сезон при развитой растительности (залежь)
+        cls[(f[..., 2] < UNUSED_DIFF_MAX) & (f[..., 0] >= FALLOW_MAX_THR)] = 3
     return cls
 
 
@@ -2006,7 +2142,10 @@ if not COMPARE:
 # %% 17_final
 def final_outputs(overview=True):
     """Итог: fields_final_<режим><метка>.gpkg (слой fields; fields_split — разбивка по классам; spots — пятна) + картинка обзора."""
+    global FIELDS, CLASS_SPLIT
     final_path = Path(OUT_DIR) / f'fields_final_{RUN_MODE}{TAG}.gpkg'
+    FIELDS = regularize_boundaries(FIELDS)
+    CLASS_SPLIT = regularize_boundaries(CLASS_SPLIT)
     FIELDS.to_file(final_path, driver='GPKG', layer='fields')
     if CLASS_SPLIT is not None:
         CLASS_SPLIT.to_file(final_path, driver='GPKG', layer='fields_split')

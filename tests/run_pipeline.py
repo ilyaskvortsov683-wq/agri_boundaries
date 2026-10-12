@@ -11,6 +11,9 @@ parts = re.split(r'^# %% (\S+)(?: \[markdown\])?\n', text, flags=re.M)
 cells = [(parts[i], parts[i + 1]) for i in range(1, len(parts), 2)]
 import matplotlib; matplotlib.use('Agg')
 g = globals()
+if OPT.get('wc_npy'):                                   # WorldCover из .npy на сетке растра вместо GEE (для проверок вне Colab)
+    from unittest.mock import MagicMock
+    sys.modules['ee'] = MagicMock()
 run.mkdir(parents=True, exist_ok=True)
 shutil.copy(tif, run / 'SAM.tif')
 
@@ -31,5 +34,15 @@ for name, body in cells:
     exec(compile(body, name, 'exec'), g)
     if name == '2_params':
         ov()
+    if name == '9_segmentation_stage' and OPT.get('wc_npy'):
+        _WC = np.load(OPT['wc_npy'])
+        def _wc_from_npy(t, h, w, tag):
+            c0, r0 = int(round((t.c - g['T'].c) / g['T'].a)), int(round((t.f - g['T'].f) / g['T'].e))
+            out = np.zeros((h, w), np.uint8)
+            ra, ca = max(r0, 0), max(c0, 0)
+            sub = _WC[ra:r0 + h, ca:c0 + w]
+            out[ra - r0:ra - r0 + sub.shape[0], ca - c0:ca - c0 + sub.shape[1]] = sub
+            return out
+        g['get_wc_map'] = _wc_from_npy
     if name == '14b_refine_funcs' and OPT.get('fake_basemap'):      # проверка обвязки этапа 5 без сети: шумовая «подложка»
         g['basemap_rgb'] = lambda Tb, shape: np.random.default_rng(0).integers(0, 255, (*shape, 3)).astype(np.uint8)

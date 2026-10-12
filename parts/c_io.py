@@ -155,6 +155,44 @@ def get_input(k):
     raise RuntimeError(f'Этап {k}: нет входных полей. Включите этап 1 (и промежуточные) или задайте IN_LAYERS[{k!r}].')
 
 
+def regularize_boundaries(gdf, tol_m=None):
+    """Выпрямление границ с сохранением общей топологии: границы всех полигонов разбиваются на дуги между узлами
+    (там, где сходятся ≥3 границ), каждая дуга упрощается Дугласом–Пекером с допуском tol_m (метры, проекция UTM),
+    полигоны собираются заново (polygonize) и получают атрибуты исходных. Общая граница двух полей остаётся общей.
+    Площадь и IoU почти не меняются; эталонная цифровка ≈ 10 вершин/км и ~2/3 периметра в прямых отрезках ≥ 150 м."""
+    tol_m = REGULARIZE_TOL_M if tol_m is None else tol_m
+    if gdf is None or len(gdf) == 0 or not tol_m:
+        return gdf
+    from shapely.ops import polygonize
+    c = gdf.to_crs(4326).total_bounds
+    utm = f'EPSG:{32600 + int(((c[0] + c[2]) / 2 + 180) // 6) + 1}' if not CRS.is_projected else CRS
+    g6 = gdf.reset_index(drop=True).to_crs(utm)
+    geoms = shapely.make_valid(g6.geometry.values)
+    geoms = np.array([x if x.geom_type in ('Polygon', 'MultiPolygon') else
+                      shapely.union_all([q for q in shapely.get_parts(x) if q.geom_type in ('Polygon', 'MultiPolygon')]) for x in geoms], dtype=object)
+    try:
+        lines = shapely.line_merge(shapely.union_all(shapely.boundary(geoms)))
+        simp = list(shapely.get_parts(lines.simplify(tol_m, preserve_topology=True)))     # все дуги вместе: пересечений между ними не возникает
+        faces = list(polygonize(simp))
+        tree = shapely.STRtree(geoms)
+        rep = shapely.point_on_surface(np.array(faces, dtype=object))
+        owner = {}
+        for f, pt in zip(faces, rep):
+            hit = [k for k in tree.query(pt, predicate='within')]
+            if hit:
+                owner.setdefault(int(hit[0]), []).append(f)
+        out_geoms = [shapely.union_all(owner[k]) if k in owner else geoms[k] for k in range(len(geoms))]
+    except Exception as e:
+        print('  регуляризация: topo-упрощение не удалось, упрощение по полигонам:', str(e)[:80])
+        out_geoms = [x.simplify(tol_m, preserve_topology=True) for x in geoms]
+    g6 = g6.copy(); g6['geometry'] = shapely.make_valid(np.array(out_geoms, dtype=object))
+    g6 = g6[~g6.geometry.is_empty].to_crs(gdf.crs)
+    g6['geometry'] = shapely.make_valid(g6.geometry.values)
+    g6 = g6.explode(index_parts=False).reset_index(drop=True)
+    g6 = g6[g6.geometry.geom_type == 'Polygon'].reset_index(drop=True)
+    return add_area(g6)
+
+
 def add_area(gdf):
     gdf = gdf.copy()
     gdf['area_ha'] = (gdf.to_crs('EPSG:6933').geometry.area / 1e4).round(3) if not CRS.is_projected else (gdf.geometry.area / 1e4).round(3)

@@ -69,7 +69,10 @@ if not COMPARE:
 # %% 17_final
 def final_outputs(overview=True):
     """Итог: fields_final_<режим><метка>.gpkg (слой fields; fields_split — разбивка по классам; spots — пятна) + картинка обзора."""
+    global FIELDS, CLASS_SPLIT
     final_path = Path(OUT_DIR) / f'fields_final_{RUN_MODE}{TAG}.gpkg'
+    FIELDS = regularize_boundaries(FIELDS)
+    CLASS_SPLIT = regularize_boundaries(CLASS_SPLIT)
     FIELDS.to_file(final_path, driver='GPKG', layer='fields')
     if CLASS_SPLIT is not None:
         CLASS_SPLIT.to_file(final_path, driver='GPKG', layer='fields_split')

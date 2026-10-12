@@ -4,60 +4,7 @@
 # и по резким ступенькам тона. Линии ищутся ориентированными фильтрами (усреднение ВДОЛЬ линии, поэтому ловятся
 # слабые линии, которые top-hat барьеры этапа 1 пропускают), затем отсеиваются по длине. Работает только внутри
 # выбранных полигонов, растр читается окнами — это дёшево и не требует повторной сегментации.
-from scipy.signal import fftconvolve
 from scipy.ndimage import binary_erosion, binary_dilation, label as ndi_label3, distance_transform_edt as _edt
-from skimage.morphology import skeletonize
-from skimage.filters import apply_hysteresis_threshold
-
-_SPLIT_K = {}
-_SPLIT_BASE = dict(E_MIN=6.3, R_MIN=3.15, E_MAX=9.1)   # пороги отклика при SENS=1 (в единицах NDVI 0–255); SENS делит их
-
-
-def _line_kernel(theta, s_across, s_along, kind):
-    key = (round(float(theta), 4), s_across, s_along, kind)
-    if key not in _SPLIT_K:
-        r = int(3 * max(s_across, s_along)) + 1
-        y, x = np.mgrid[-r:r + 1, -r:r + 1].astype(np.float32)
-        u = x * np.cos(theta) + y * np.sin(theta)                 # поперёк линии
-        v = -x * np.sin(theta) + y * np.cos(theta)                # вдоль линии
-        gk = np.exp(-u ** 2 / (2 * s_across ** 2) - v ** 2 / (2 * s_along ** 2))
-        k = (-u / s_across ** 2 * gk) if kind == 'edge' else ((1 - u ** 2 / s_across ** 2) * gk)
-        if kind == 'ridge':
-            k = k - k.mean()
-        _SPLIT_K[key] = (k / np.abs(k).sum()).astype(np.float32)
-    return _SPLIT_K[key]
-
-
-def _oriented(ch, kind, s_across, s_along, n=12):
-    out = np.zeros(ch.shape, np.float32)
-    for i in range(n):
-        r = fftconvolve(ch, _line_kernel(np.pi * i / n, s_across, s_along, kind), mode='same')
-        np.maximum(out, np.abs(r) if kind == 'edge' else r, out=out)
-    return out
-
-
-def _line_resp(feats, sens, s_along):
-    s = np.stack([gaussian_filter(feats[..., k], 0.7) for k in range(2)], -1).astype(np.float32)
-    mx, mn = s[..., 0], s[..., 1]
-    b = _SPLIT_BASE
-    return np.maximum.reduce([_oriented(mn, 'edge', 1.3, s_along) * sens / b['E_MIN'],
-                              _oriented(mn, 'ridge', 1.3, s_along) * sens / b['R_MIN'],
-                              _oriented(mx, 'edge', 1.3, s_along) * sens / b['E_MAX']])
-
-
-def split_line_response(feats, sens, s_along, block=2500, halo=24):
-    """Нормированный отклик «линия/ступенька» (≥ 1 — уверенная линия). Каналы: min (ступенька и тонкая линия), max (ступенька).
-    Окна больше block×block считаются блоками с перекрытием (экономия памяти для полигонов-гигантов)."""
-    h, w = feats.shape[:2]
-    if h * w <= 1.5 * block * block:
-        return _line_resp(feats, sens, s_along)
-    R = np.zeros((h, w), np.float32)
-    for r0 in range(0, h, block):
-        for c0 in range(0, w, block):
-            ra, rb, ca, cb = max(r0 - halo, 0), min(r0 + block + halo, h), max(c0 - halo, 0), min(c0 + block + halo, w)
-            Rb = _line_resp(feats[ra:rb, ca:cb], sens, s_along)
-            R[r0:r0 + block, c0:c0 + block] = Rb[r0 - ra:r0 - ra + min(block, h - r0), c0 - ca:c0 - ca + min(block, w - c0)]
-    return R
 
 
 def split_labels(feats, fm, P):

@@ -165,7 +165,8 @@ def seg_raw(name, overrides, exclude=None):
     """Один проход по тайлам: сегментация → «сырые» регионы (все тона и размеры) → склейка швов.
     Результат кэшируется по тайлам; тайлы считаются параллельно (N_WORKERS процессов)."""
     set_params(*overrides)
-    p = {k: globals()[k] for k in BASE}
+    POST_ONLY = ('SIMPLIFY_PX', 'MIN_FIELD_HA', 'FILL_HOLES_HA', 'MIN_WIDTH_PX', 'SMOOTH_LABELS')    # влияют только на make_fields — сегментацию не пересчитывают
+    p = {k: globals()[k] for k in BASE if k not in POST_ONLY}
     p.update(TILE=TILE, HALO=HALO, REGION=REGION, AGRI=AGRI_CLASSES, WC=USE_WORLDCOVER, EX=layer_hash(exclude), V=5)
     h = hashlib.md5(json.dumps(p, sort_keys=True, default=str).encode()).hexdigest()[:8]
     tdir = Path(OUT_DIR) / f'tiles5_{RUN_MODE}_{name}_{h}'
@@ -189,9 +190,65 @@ def seg_raw(name, overrides, exclude=None):
     raw = gpd.GeoDataFrame(pd.concat([gpd.read_parquet(f) for f in files], ignore_index=True), geometry='geometry', crs=None)
     if not SEAM_CONSTRAIN:
         return merge_across_seams_legacy(raw, SEAM_THR, MIN_CONTACT)
-    max_px = int(MAX_REGION_HA / px_area_ha) if MAX_REGION_HA else 0
+    max_px = int(max(SEAM_MAX_REGION_HA, MAX_REGION_HA) / px_area_ha) if MAX_REGION_HA else 0
     cmin_px = int(COMPACT_MIN_HA / px_area_ha) if COMPACT_MIN_HA else 0
     return merge_across_seams(raw, SEAM_THR, MIN_CONTACT, seam_jump_fn, JUMP_THR, max_px, MIN_COMPACT, cmin_px)
+
+
+WC_REGION = None
+
+
+def wc_region():
+    """WorldCover на сетке растра для всей области (np.memmap uint8; собирается из кэша тайлов). None — без WorldCover."""
+    global WC_REGION
+    if not USE_WORLDCOVER:
+        return None
+    if WC_REGION is None:
+        path = Path(LOCAL_DIR) / f'wc_region_{RUN_MODE}_{X0}_{Y0}_{X1}_{Y1}.u8'
+        mm = np.memmap(path, dtype=np.uint8, mode='w+', shape=(Y1 - Y0, X1 - X0))
+        for tile in tiles:
+            win, t_halo, h, w, tag = tile_info(tile)
+            wc = get_wc_map(t_halo, h, w, tag)
+            c0, r0, c1, r1 = tile['core']; hc0, hr0 = tile['halo'][:2]
+            mm[r0 - Y0:r1 - Y0, c0 - X0:c1 - X0] = wc[r0 - hr0:r1 - hr0, c0 - hc0:c1 - hc0]
+        mm.flush()
+        WC_REGION = mm
+    return WC_REGION
+
+
+def polygon_crop_frac(gdf):
+    """Доля пашни (AGRI_CLASSES) WorldCover внутри каждого полигона (по пикселям растра)."""
+    mm = wc_region()
+    out = np.ones(len(gdf))
+    if mm is None:
+        return out
+    for i, g_ in enumerate(gdf.geometry.values):
+        win, _ = field_window(g_, margin=0)
+        if win is None:
+            out[i] = 0; continue
+        ca, ra = max(int(win.col_off), X0), max(int(win.row_off), Y0)
+        cb, rb = min(int(win.col_off + win.width), X1), min(int(win.row_off + win.height), Y1)
+        if cb <= ca or rb <= ra:
+            out[i] = 0; continue
+        wt = rasterio.windows.transform(Window(ca, ra, cb - ca, rb - ra), T)
+        m = rasterize([(g_, 1)], out_shape=(rb - ra, cb - ca), transform=wt, fill=0, dtype='uint8').astype(bool)
+        if m.any():
+            out[i] = float(np.isin(mm[ra - Y0:rb - Y0, ca - X0:cb - X0], AGRI_CLASSES)[m].mean())
+    return out
+
+
+def crop_filter(gdf, min_frac=None, label=''):
+    """Оставляет полигоны, на которых пашни WorldCover ≥ min_frac (по умолчанию CROP_POLY_MIN); записывает crop_wc."""
+    min_frac = CROP_POLY_MIN if min_frac is None else min_frac
+    if gdf is None or len(gdf) == 0 or not min_frac or not USE_WORLDCOVER:
+        return gdf
+    fr = polygon_crop_frac(gdf)
+    gdf = gdf.copy(); gdf['crop_wc'] = fr.round(3)
+    keep = fr >= min_frac
+    if (~keep).any():
+        by = gdf[~keep]['kind'].value_counts().to_dict() if 'kind' in gdf.columns else {}
+        print(f'  пашня WorldCover < {min_frac:.0%}: убрано {int((~keep).sum())} из {len(gdf)} {label}{by}')
+    return gdf[keep].reset_index(drop=True)
 
 
 def make_fields(merged, tone, min_ha, fill_ha, width_px, min_solidity=0.0, kind='main', crop_min=0.0, simplify_px=None):
@@ -294,7 +351,7 @@ def do_stage1():
                     simplify_px=s1_param('SIMPLIFY_PX'))
     if r is None or r.empty:
         raise RuntimeError('Этап 1: полей нет')
-    FIELDS = renumber(r)
+    FIELDS = renumber(crop_filter(r, label='(этап 1) '))
     save_stage(1, FIELDS)
     d = describe(FIELDS)
     print(f'  этап 1: максимум {d["max_ha"]} га, полигонов > {GIANT_HA} га: {d["n_giant"]} ({d["giant_share"]:.0%} площади)')
@@ -321,6 +378,7 @@ def do_stage2():
     if new is not None and len(new):
         new = subtract_existing(new, base, S2['MIN_FIELD_HA'])
         new = shape_filter(new, None, S2['MAX_HOLE_FRAC'])
+        new = crop_filter(new, label='(мелкие) ')
         new['kind'] = np.where(new.area_ha >= s1_param('MIN_FIELD_HA'), 'main', 'small')
         new = new[new.kind == 'small'] if not S2_FINE_PASS else new
         n_new = len(new)
@@ -346,6 +404,7 @@ def do_stage3():
     if new is not None and len(new):
         new = subtract_existing(new, base, S3['MIN_FIELD_HA'])
         new = shape_filter(new, S3['MAX_FIELD_HA'], S3['MAX_HOLE_FRAC'])
+        new = crop_filter(new, label='(жёлтые) ')
         n_new = len(new)
         base = pd.concat([base, new], ignore_index=True)
     FIELDS = renumber(resolve_nested(gpd.GeoDataFrame(base, geometry='geometry', crs=CRS)))

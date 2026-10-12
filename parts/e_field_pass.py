@@ -79,6 +79,8 @@ def pixel_classes(f, allow_fallow=True):
     if allow_fallow:
         cls[f[..., 0] < FALLOW_MAX_THR] = 2             # пар: растительность за сезон не развилась
     cls[f[..., 1] >= UNUSED_MIN_THR] = 3                # неиспользуемое: min NDVI не падает (травостой/залежь/кустарник)
+    if UNUSED_DIFF_MAX:                                 # … или слабый размах NDVI за сезон при развитой растительности (залежь)
+        cls[(f[..., 2] < UNUSED_DIFF_MAX) & (f[..., 0] >= FALLOW_MAX_THR)] = 3
     return cls
 
 
