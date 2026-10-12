@@ -11,7 +11,12 @@ fl = gpd.read_file(sys.argv[1], layer=os.environ.get('LAYER', 'fields') if sys.a
 gt = gpd.read_file(sys.argv[2])
 tif = glob.glob('/root/.claude/uploads/*/*2.tif')[0] if len(sys.argv) < 6 else sys.argv[5]
 src = rasterio.open(tif); T = src.transform; H, W = src.height, src.width
-gt['geometry'] = shapely.make_valid(gt.geometry.values); gt = gt.to_crs(6933); gt['geometry'] = shapely.make_valid(gt.geometry.values); gt = gt[gt.area / 1e4 >= MIN_HA].reset_index(drop=True); gt_ll = gt.to_crs(4326)
+import os
+XMIN = int(os.environ.get('GT_XMIN_COL', 0))                       # оценка только по полям правее этой колонки (hold-out)
+gt['geometry'] = shapely.make_valid(gt.geometry.values)
+if XMIN:
+    gt = gt[gt.geometry.centroid.x >= T.c + XMIN * T.a].reset_index(drop=True)
+gt = gt.to_crs(6933); gt['geometry'] = shapely.make_valid(gt.geometry.values); gt = gt[gt.area / 1e4 >= MIN_HA].reset_index(drop=True); gt_ll = gt.to_crs(4326)
 fl['geometry'] = shapely.make_valid(fl.geometry.values); fl6 = fl.to_crs(6933); fl6['geometry'] = shapely.make_valid(fl6.geometry.values)
 tree = shapely.STRtree(fl6.geometry.values)
 ious, frag, merged = [], [], np.zeros(len(fl6), int)

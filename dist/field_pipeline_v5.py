@@ -142,7 +142,8 @@ BASE = dict(
     SEAM_CONSTRAIN=True,   # склейка через швы тайлов: с проверкой резкости границы (JUMP_THR), размера и компактности; False — как в v3
     WC_BARRIER_MIN_PX=30,  # BARRIER_WC_CLASSES: компоненты WorldCover мельче этого размера (px) игнорируются (шум)
     # длинные прямые линии/ступеньки тона как барьеры ДО слияния (v6; ловят слабые границы между соседними полями)
-    LINE_SENS=0.45,        # чувствительность (0 — выкл.): больше → ловит более слабые линии (≥1 — пересегментация текстуры)
+    LINE_SENS=0.45,        # чувствительность к ТОНКИМ линиям — лесополосы, дороги, межи (0 — выкл.); ≥1 — пересегментация текстуры
+    LINE_EDGE_SENS=0.25,   # чувствительность к СТУПЕНЬКАМ тона (граница другого класса); меньше → слабые границы между участками одного массива не режутся; 0 — только тонкие линии
     LINE_MIN_PX=40,        # линии короче (px) игнорируются (1 px ≈ 6×10 м)
     LINE_SIGMA_ALONG=4,    # длина усреднения вдоль линии; больше → только прямые длинные линии
     LINE_DIL=1,            # утолщение линии-барьера, px (закрывает разрывы)
@@ -150,16 +151,20 @@ BASE = dict(
 )
 
 PRESETS = {
-    # ── семейство L (v6): линии как барьеры до слияния + ограничения размера/компактности/швов ──
-    'L_base':     dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0),          # основной кандидат: леса/застройка/вода — барьеры; сёла не заливать
-    'L_soft':     dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0, LINE_SENS=0.35),   # только явные линии
-    'L_strong':   dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0, LINE_SENS=0.6),    # больше слабых линий (больше мелких кусков)
-    'L_long':     dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0, LINE_SIGMA_ALONG=8, LINE_MIN_PX=60),   # только длинные прямые линии
-    'L_nowc':     dict(),                                                                   # без WorldCover-барьеров
+    # ── семейство L (v6): линии/ступеньки как барьеры ДО слияния + ограничения размера/компактности/швов ──
+    # LINE_SENS — чувствительность к тонким линиям (лесополосы, дороги), LINE_EDGE_SENS — к ступенькам тона (граница класса).
+    # Культуры внутри одного массива не разделяются: ступеньки слабее LINE_EDGE_SENS игнорируются.
+    'L_base':     dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0),                                   # основной кандидат; леса/застройка/вода — барьеры, сёла внутри поля не заливать
+    'L_ridge':    dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0, LINE_EDGE_SENS=0, SPLIT=dict(EDGE_SENS=0)),            # режет только по тонким линиям
+    'L_edges':    dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0, LINE_EDGE_SENS=0.45, SPLIT=dict(SENS=0.8, EDGE_SENS=0.8)),   # режет и по более слабым ступенькам (больше мелких кусков)
+    'L_soft':     dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0, LINE_SENS=0.3, SPLIT=dict(SENS=0.6)),                   # только самые явные линии
+    'L_strong':   dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0, LINE_SENS=0.7, SPLIT=dict(SENS=1.0)),                   # больше тонких линий
+    'L_long':     dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0, LINE_SIGMA_ALONG=8, LINE_MIN_PX=60),                    # только длинные прямые линии
+    'L_nowc':     dict(),                                                              # без WorldCover-барьеров
     'L_cap400':   dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0, MAX_REGION_HA=400),
     'L_sharp':    dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0, MERGE_THR=40, JUMP_THR=10, BARRIER_THR=22),
-    'L_smooth':   dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0, SMOOTH_SIGMA=1.2, RELAX_BETA=600, SIMPLIFY_PX=3.0),   # глаже границы
-    'L_split_off': dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0, NO_STAGES=['1b']),        # без этапа 1b
+    'L_smooth':   dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0, SMOOTH_SIGMA=1.2, RELAX_BETA=600),                      # глаже границы
+    'L_split_off': dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0, NO_STAGES=['1b']),                                      # без этапа 1b
     # ── v5 и v3 для сравнения (в сравнении по умолчанию не участвуют) ──
     'OLD_C_base': dict(LINE_SENS=0, SIMPLIFY_PX=0.8),
     'OLD_A_best': dict(LINE_SENS=0, SIMPLIFY_PX=0.8, MAX_REGION_HA=0, MIN_COMPACT=0, SEAM_CONSTRAIN=False),
@@ -177,7 +182,8 @@ GIANT_HA        = 600                # полигон крупнее — «ги�
 SPLIT = dict(
     KINDS=('main', 'input'),   # к каким полям применять (kind); None — ко всем
     MIN_HA=40,                 # полигоны меньше этой площади не трогаем
-    SENS=1.0,                  # чувствительность: больше → режет по более слабым линиям (1.4 — много разбивок, 0.7 — только явные)
+    SENS=0.8,                  # чувствительность к тонким линиям: больше → режет по более слабым (1.4 — много разбивок, 0.6 — только явные)
+    EDGE_SENS=0.25,            # чувствительность к ступенькам тона (граница другого класса); 0 — резать только по линиям
     PIECE_MIN_HA=8,            # кусок меньше этого не становится отдельным полем (отдаётся соседу)
     LINE_MIN_PX=30,            # минимальная длина линии, px (1 px ≈ 8 м)
     LINE_DIL=2,                # «толщина» разреза, px: закрывает разрывы линии
@@ -248,10 +254,10 @@ FALLOW_MAX_THR    = 170       # max < порога → за сезон раст�
 UNUSED_DIFF_MAX   = 130       # diff < порога (при max ≥ FALLOW_MAX_THR) → тоже «неиспользуемое»: слабый размах NDVI за сезон (0 — выкл.)
 FALLOW_MIN_FIELD_HA = 15.5    # поля меньше этой площади паром не бывают: пиксели «пар» в них считаются засеянными
 CLASS_SIGMA       = 1.0       # сглаживание каналов перед правилами
-CLASS_SMOOTH_WIN  = 5         # мажоритарное окно 5 или 7 (0 — выкл.)
-CLASS_MINOR_FRAC  = 0.25      # второй класс записывается, если его доля ≥ 25 %
+CLASS_SMOOTH_WIN  = 15        # мажоритарное окно, px (0 — выкл.): крупнее → ровнее границы между классами внутри поля
+CLASS_MINOR_FRAC  = 0.3       # второй класс записывается, если его доля ≥ 30 %
 SPLIT_BY_CLASS    = True      # слой с разбивкой поля по границе между двумя основными классами
-SPLIT_MIN_HA      = 2.0       # куски разбивки мельче поглощаются соседним классом
+SPLIT_MIN_HA      = 8.0       # куски разбивки мельче поглощаются соседним классом
 CLASS_TRAIN_LAYER = None      # для 'tree': GeoJSON/GPKG с размеченными полями
 CLASS_TRAIN_COL   = None      # колонка с классом (значения — любые метки)
 # Пороги выше подобраны по размеченным полям Донбасса (hold-out: залежь 41 % → 75–82 %, пар 81 % → 91 % при той же общей точности).
@@ -346,35 +352,40 @@ def _oriented(ch, kind, s_across, s_along, n=12):
     return out
 
 
-def _line_resp(feats, sens, s_along):
+def _line_resp(feats, sens, s_along, edge_sens=None):
+    """sens — чувствительность к ТОНКИМ линиям (лесополосы, дороги, межи: ridge в канале min);
+    edge_sens — к СТУПЕНЬКАМ тона (граница другого класса/культуры: edge в каналах min и max); по умолчанию = sens.
+    Ступеньки между участками разных культур внутри одного массива резать не нужно — для этого edge_sens делают меньше."""
+    edge_sens = sens if edge_sens is None else edge_sens
     s = np.stack([gaussian_filter(feats[..., k], 0.7) for k in range(2)], -1).astype(np.float32)
     mx, mn = s[..., 0], s[..., 1]
     b = _SPLIT_BASE
-    return np.maximum.reduce([_oriented(mn, 'edge', 1.3, s_along) * sens / b['E_MIN'],
-                              _oriented(mn, 'ridge', 1.3, s_along) * sens / b['R_MIN'],
-                              _oriented(mx, 'edge', 1.3, s_along) * sens / b['E_MAX']])
+    comps = [_oriented(mn, 'ridge', 1.3, s_along) * sens / b['R_MIN']]
+    if edge_sens:
+        comps += [_oriented(mn, 'edge', 1.3, s_along) * edge_sens / b['E_MIN'], _oriented(mx, 'edge', 1.3, s_along) * edge_sens / b['E_MAX']]
+    return np.maximum.reduce(comps)
 
 
-def split_line_response(feats, sens, s_along, block=2500, halo=24):
+def split_line_response(feats, sens, s_along, block=2500, halo=24, edge_sens=None):
     """Нормированный отклик «линия/ступенька» (≥ 1 — уверенная линия). Каналы: min (ступенька и тонкая линия), max (ступенька).
     Окна больше block×block считаются блоками с перекрытием (экономия памяти для полигонов-гигантов)."""
     h, w = feats.shape[:2]
     if h * w <= 1.5 * block * block:
-        return _line_resp(feats, sens, s_along)
+        return _line_resp(feats, sens, s_along, edge_sens)
     R = np.zeros((h, w), np.float32)
     for r0 in range(0, h, block):
         for c0 in range(0, w, block):
             ra, rb, ca, cb = max(r0 - halo, 0), min(r0 + block + halo, h), max(c0 - halo, 0), min(c0 + block + halo, w)
-            Rb = _line_resp(feats[ra:rb, ca:cb], sens, s_along)
+            Rb = _line_resp(feats[ra:rb, ca:cb], sens, s_along, edge_sens)
             R[r0:r0 + block, c0:c0 + block] = Rb[r0 - ra:r0 - ra + min(block, h - r0), c0 - ca:c0 - ca + min(block, w - c0)]
     return R
 
 
-def detect_line_barriers(feats, valid, sens, s_along, min_px, edge_px=0):
+def detect_line_barriers(feats, valid, sens, s_along, min_px, edge_sens=None):
     """Длинные прямые тонкие линии и ступеньки тона (межи, дороги, слабые лесополосы, границы соседних культур).
     Ориентированные фильтры усредняют ВДОЛЬ линии, поэтому ловят линии, невидимые для слияния по средним (скачок < JUMP_THR).
     Результат: скелет линий (1 px) длиной ≥ min_px. Операция локальна: не зависит от разбиения на тайлы (при достаточном HALO)."""
-    R = split_line_response(feats, sens, s_along)
+    R = split_line_response(feats, sens, s_along, edge_sens=edge_sens)
     R = np.where(valid, R, 0)
     cand = apply_hysteresis_threshold(R, 0.6, 1.0)
     lab, n = ndi_label(skeletonize(cand), structure=np.ones((3, 3)))
@@ -574,7 +585,7 @@ def segment_regions(feats, valid, crop=None, wcmap=None):
         else np.zeros(valid.shape, bool)
     line_b = np.zeros(valid.shape, bool)
     if LINE_SENS:
-        line_b = detect_line_barriers(feats, valid, LINE_SENS, LINE_SIGMA_ALONG, LINE_MIN_PX)
+        line_b = detect_line_barriers(feats, valid, LINE_SENS, LINE_SIGMA_ALONG, LINE_MIN_PX, LINE_EDGE_SENS)
         if LINE_DIL > 0 and line_b.any():
             line_b = binary_dilation(line_b, structure=np.ones((3, 3), bool), iterations=int(LINE_DIL))
         line_b &= valid & ~barrier                  # там, где уже барьер-лесополоса, линия не нужна
@@ -1492,7 +1503,7 @@ from scipy.ndimage import binary_erosion, binary_dilation, label as ndi_label3, 
 
 def split_labels(feats, fm, P):
     """Метки кусков внутри маски поля fm (0 — вне поля) или None, если разбивать нечем."""
-    R = split_line_response(feats, P['SENS'], P['SIGMA_ALONG'])
+    R = split_line_response(feats, P['SENS'], P['SIGMA_ALONG'], edge_sens=P.get('EDGE_SENS'))
     core = binary_erosion(fm, iterations=P['EDGE_PX'])
     cand = apply_hysteresis_threshold(np.where(core, R, 0), 0.6, 1.0)
     lab, n = ndi_label3(skeletonize(cand), structure=np.ones((3, 3)))
@@ -1589,7 +1600,7 @@ def _shapes_px(lab):
 
 def do_stage1b():
     global FIELDS
-    FIELDS = renumber(split_fields(get_input('1b'), SPLIT_OVER)[0])      # SPLIT_OVER — перекрытия SPLIT из пресета
+    FIELDS = renumber(crop_filter(split_fields(get_input('1b'), SPLIT_OVER)[0], label='(куски 1b) '))      # SPLIT_OVER — перекрытия SPLIT из пресета
     save_stage('1b', FIELDS)
     return FIELDS
 

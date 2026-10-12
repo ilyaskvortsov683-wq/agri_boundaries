@@ -117,35 +117,40 @@ def _oriented(ch, kind, s_across, s_along, n=12):
     return out
 
 
-def _line_resp(feats, sens, s_along):
+def _line_resp(feats, sens, s_along, edge_sens=None):
+    """sens — чувствительность к ТОНКИМ линиям (лесополосы, дороги, межи: ridge в канале min);
+    edge_sens — к СТУПЕНЬКАМ тона (граница другого класса/культуры: edge в каналах min и max); по умолчанию = sens.
+    Ступеньки между участками разных культур внутри одного массива резать не нужно — для этого edge_sens делают меньше."""
+    edge_sens = sens if edge_sens is None else edge_sens
     s = np.stack([gaussian_filter(feats[..., k], 0.7) for k in range(2)], -1).astype(np.float32)
     mx, mn = s[..., 0], s[..., 1]
     b = _SPLIT_BASE
-    return np.maximum.reduce([_oriented(mn, 'edge', 1.3, s_along) * sens / b['E_MIN'],
-                              _oriented(mn, 'ridge', 1.3, s_along) * sens / b['R_MIN'],
-                              _oriented(mx, 'edge', 1.3, s_along) * sens / b['E_MAX']])
+    comps = [_oriented(mn, 'ridge', 1.3, s_along) * sens / b['R_MIN']]
+    if edge_sens:
+        comps += [_oriented(mn, 'edge', 1.3, s_along) * edge_sens / b['E_MIN'], _oriented(mx, 'edge', 1.3, s_along) * edge_sens / b['E_MAX']]
+    return np.maximum.reduce(comps)
 
 
-def split_line_response(feats, sens, s_along, block=2500, halo=24):
+def split_line_response(feats, sens, s_along, block=2500, halo=24, edge_sens=None):
     """Нормированный отклик «линия/ступенька» (≥ 1 — уверенная линия). Каналы: min (ступенька и тонкая линия), max (ступенька).
     Окна больше block×block считаются блоками с перекрытием (экономия памяти для полигонов-гигантов)."""
     h, w = feats.shape[:2]
     if h * w <= 1.5 * block * block:
-        return _line_resp(feats, sens, s_along)
+        return _line_resp(feats, sens, s_along, edge_sens)
     R = np.zeros((h, w), np.float32)
     for r0 in range(0, h, block):
         for c0 in range(0, w, block):
             ra, rb, ca, cb = max(r0 - halo, 0), min(r0 + block + halo, h), max(c0 - halo, 0), min(c0 + block + halo, w)
-            Rb = _line_resp(feats[ra:rb, ca:cb], sens, s_along)
+            Rb = _line_resp(feats[ra:rb, ca:cb], sens, s_along, edge_sens)
             R[r0:r0 + block, c0:c0 + block] = Rb[r0 - ra:r0 - ra + min(block, h - r0), c0 - ca:c0 - ca + min(block, w - c0)]
     return R
 
 
-def detect_line_barriers(feats, valid, sens, s_along, min_px, edge_px=0):
+def detect_line_barriers(feats, valid, sens, s_along, min_px, edge_sens=None):
     """Длинные прямые тонкие линии и ступеньки тона (межи, дороги, слабые лесополосы, границы соседних культур).
     Ориентированные фильтры усредняют ВДОЛЬ линии, поэтому ловят линии, невидимые для слияния по средним (скачок < JUMP_THR).
     Результат: скелет линий (1 px) длиной ≥ min_px. Операция локальна: не зависит от разбиения на тайлы (при достаточном HALO)."""
-    R = split_line_response(feats, sens, s_along)
+    R = split_line_response(feats, sens, s_along, edge_sens=edge_sens)
     R = np.where(valid, R, 0)
     cand = apply_hysteresis_threshold(R, 0.6, 1.0)
     lab, n = ndi_label(skeletonize(cand), structure=np.ones((3, 3)))
@@ -345,7 +350,7 @@ def segment_regions(feats, valid, crop=None, wcmap=None):
         else np.zeros(valid.shape, bool)
     line_b = np.zeros(valid.shape, bool)
     if LINE_SENS:
-        line_b = detect_line_barriers(feats, valid, LINE_SENS, LINE_SIGMA_ALONG, LINE_MIN_PX)
+        line_b = detect_line_barriers(feats, valid, LINE_SENS, LINE_SIGMA_ALONG, LINE_MIN_PX, LINE_EDGE_SENS)
         if LINE_DIL > 0 and line_b.any():
             line_b = binary_dilation(line_b, structure=np.ones((3, 3), bool), iterations=int(LINE_DIL))
         line_b &= valid & ~barrier                  # там, где уже барьер-лесополоса, линия не нужна

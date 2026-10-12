@@ -9,7 +9,7 @@ from scipy.ndimage import binary_erosion, binary_dilation, label as ndi_label3, 
 
 def split_labels(feats, fm, P):
     """Метки кусков внутри маски поля fm (0 — вне поля) или None, если разбивать нечем."""
-    R = split_line_response(feats, P['SENS'], P['SIGMA_ALONG'])
+    R = split_line_response(feats, P['SENS'], P['SIGMA_ALONG'], edge_sens=P.get('EDGE_SENS'))
     core = binary_erosion(fm, iterations=P['EDGE_PX'])
     cand = apply_hysteresis_threshold(np.where(core, R, 0), 0.6, 1.0)
     lab, n = ndi_label3(skeletonize(cand), structure=np.ones((3, 3)))
@@ -106,7 +106,7 @@ def _shapes_px(lab):
 
 def do_stage1b():
     global FIELDS
-    FIELDS = renumber(split_fields(get_input('1b'), SPLIT_OVER)[0])      # SPLIT_OVER — перекрытия SPLIT из пресета
+    FIELDS = renumber(crop_filter(split_fields(get_input('1b'), SPLIT_OVER)[0], label='(куски 1b) '))      # SPLIT_OVER — перекрытия SPLIT из пресета
     save_stage('1b', FIELDS)
     return FIELDS
 

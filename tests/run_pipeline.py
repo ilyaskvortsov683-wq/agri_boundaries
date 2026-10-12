@@ -44,5 +44,19 @@ for name, body in cells:
             out[ra - r0:ra - r0 + sub.shape[0], ca - c0:ca - c0 + sub.shape[1]] = sub
             return out
         g['get_wc_map'] = _wc_from_npy
+    if name == '5_vector_funcs' and OPT.get('barrier_npy'):            # подмена детектора линий готовой картой границ (прототип обученной модели)
+        _BAR = np.load(OPT['barrier_npy']); _orig_det = g['detect_line_barriers']; _LW = {}
+        def _det(feats, valid, sens, s_along, min_px, edge_sens=None):
+            r0, c0 = _LW['r'], _LW['c']; h, w = valid.shape
+            out = np.zeros((h, w), bool); sub = _BAR[max(r0, 0):r0 + h, max(c0, 0):c0 + w]
+            out[max(r0, 0) - r0:max(r0, 0) - r0 + sub.shape[0], max(c0, 0) - c0:max(c0, 0) - c0 + sub.shape[1]] = sub
+            if OPT.get('barrier_union'): out |= _orig_det(feats, valid, sens, s_along, min_px, edge_sens)
+            return out
+        g['detect_line_barriers'] = _det
+    if name == '9_segmentation_stage' and OPT.get('barrier_npy'):
+        _orig_rw = g['read_window']
+        def _rw(win):
+            _LW['r'], _LW['c'] = int(win.row_off), int(win.col_off); return _orig_rw(win)
+        g['read_window'] = _rw
     if name == '14b_refine_funcs' and OPT.get('fake_basemap'):      # проверка обвязки этапа 5 без сети: шумовая «подложка»
         g['basemap_rgb'] = lambda Tb, shape: np.random.default_rng(0).integers(0, 255, (*shape, 3)).astype(np.uint8)
