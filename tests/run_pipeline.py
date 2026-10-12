@@ -1,11 +1,11 @@
-"""Стенд: исполняет ячейки собранного dist/field_pipeline_v5.py в одном процессе вне Colab.
+"""Стенд: исполняет ячейки собранного dist/field_pipeline_v6.py в одном процессе вне Colab.
 python3 -I tests/run_pipeline.py <композит.tif> <рабочая_папка> ['{"over":{"STAGES":{"5":0},"RUN_MODE":"full"}}']"""
 import re, sys, json, shutil, os
 from pathlib import Path
 
 tif, run = Path(sys.argv[1]).resolve(), Path(sys.argv[2]).resolve()
 OPT = json.loads(sys.argv[3]) if len(sys.argv) > 3 else {}
-text = (Path(__file__).resolve().parent.parent / 'dist' / 'field_pipeline_v5.py').read_text(encoding='utf-8')
+text = (Path(__file__).resolve().parent.parent / 'dist' / 'field_pipeline_v6.py').read_text(encoding='utf-8')
 text = re.sub(r'^!pip.*$', '', text, flags=re.M)
 parts = re.split(r'^# %% (\S+)(?: \[markdown\])?\n', text, flags=re.M)
 cells = [(parts[i], parts[i + 1]) for i in range(1, len(parts), 2)]
