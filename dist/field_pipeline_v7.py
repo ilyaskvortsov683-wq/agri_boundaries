@@ -19,17 +19,20 @@
 # становятся дополнительными барьерами-линиями при слиянии. Можно несколько источников списком:
 # `EXT_BOUNDARY = [dict(TIF='…_ftw_prob.tif', BAND=1, THR=0.3), dict(TIF='…_boundary.tif', BAND=1, THR=0.5)]`.
 # (2) **Суперпиксели Higra** (`SEG_METHOD='higra'`): иерархия водоразделов по градиенту вместо SLIC — точнее идут по границам.
-# (3) Пресеты `L_ext`, `L_ext_hg`, `L_hg`; подбор параметров под вашу разметку — ноутбук `research/06` (Optuna).
+# (3) Пресеты `L_ext`, `L_ext_hg`, `L_hg`, `L_ext_tuned`; подбор параметров под вашу разметку — ноутбук `research/06` (Optuna).
 #
 # Донбасс, 301 эталонное поле, композит 2026:
 #
 # | вариант | IoU | IoU≥0,7 | bF |
 # |---|---|---|---|
 # | v6 `L_base` | 0,635 | 0,55 | 0,71 |
-# | + границы FTW Global 2022 (`L_ext`) | 0,670 | 0,59 | 0,72 |
+# | + карта границ FTW Global 2022+2023+2025 (`L_ext`) | 0,670 | 0,59 | 0,72 |
 # | + границы FTW/PRUE по снимкам 2026 | 0,657 | 0,58 | 0,71 |
 # | + FTW Global и PRUE 2026 списком | 0,678 | 0,60 | 0,73 |
-# | + FTW Global и PRUE 2026 + Higra (`L_ext_hg`) | **0,684** | **0,61** | 0,72 |
+# | + FTW Global и PRUE 2026 + Higra (`L_ext_hg`) | 0,684 | 0,61 | 0,72 |
+# | + FTW Global + параметры, подобранные Optuna (`L_ext_tuned`)* | **0,693** | **0,63** | **0,74** |
+#
+# \* подбор шёл по западной половине разметки; на восточной (контроль) IoU 0,652 → 0,674 — параметры переносятся.
 #
 # **Что было в v6.** Линии (лесополосы, дороги) и ступеньки тона (граница другого класса) стали барьерами ДО слияния (`LINE_SENS`, `LINE_EDGE_SENS`); границы выпрямляются
 # (`REGULARIZE_TOL_M`); готовые полигоны всех типов должны быть на ≥ 50 % пашней WorldCover (`CROP_POLY_MIN`); пороги классов подобраны по размеченным полям;
@@ -200,6 +203,9 @@ PRESETS = {
     'L_ext':      dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0, EXT_TIF=EXT_BOUNDARY, EXT_THR=0.3),                       # + линии внешней карты границ (FTW/нейросеть/многодатные)
     'L_ext_hg':   dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0, EXT_TIF=EXT_BOUNDARY, EXT_THR=0.3, SEG_METHOD='higra', HG_HIERARCHY='dynamics'),  # то же + суперпиксели Higra
     'L_hg':       dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0, SEG_METHOD='higra', HG_HIERARCHY='dynamics'),              # только суперпиксели Higra
+    'L_ext_tuned': dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0, EXT_TIF=EXT_BOUNDARY, EXT_THR=0.18, SEG_METHOD='higra', HG_HIERARCHY='dynamics',
+                   SP_SIZE_PX=90, COMPACTNESS=0.23, MERGE_THR=64, JUMP_THR=16, LINE_SENS=0.51, LINE_EDGE_SENS=0.0, MIN_COMPACT=5.4, RELAX_BETA=500),
+                   # подобрано ноутбуком research/06 на Донбассе (40 проб, карта FTW Global); на контрольной половине IoU 0,652 → 0,674
     'L_nowc':     dict(),                                                              # без WorldCover-барьеров
     'L_cap400':   dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0, MAX_REGION_HA=400),
     'L_sharp':    dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0, MERGE_THR=40, JUMP_THR=10, BARRIER_THR=22),

@@ -70,7 +70,7 @@ YEAR = 2026
 WIN_A = ('2026-05-01', '2026-06-15')
 WIN_B = ('2026-07-25', '2026-09-10')
 
-MODEL = 'FTW_PRUE_EFNET_B5'         # или 'FTW_PRUE_EFNET_B7' (точнее, медленнее), '…_B3', '…_B5_CCBY' (лицензия CC-BY)
+MODEL = 'FTW_PRUE_EFNET_B5'         # или '…_B7' (точнее, медленнее), '…_B3', '…_B5_CCBY' (CC-BY), или путь к своему .ckpt из ноутбука 04
 BLOCK_DEG = 0.5                     # размер блока экспорта/инференса в градусах
 MIN_CROP_FRAC = 0.5                 # доля пашни WorldCover в полигоне (как в конвейере)
 MIN_HA = 1.0                        # минимальная площадь поля, га
@@ -91,7 +91,11 @@ NAME = 'TAT_2026'
 import numpy as np, pandas as pd, geopandas as gpd, shapely, rasterio
 from rasterio.warp import transform_bounds
 OUT = DRIVE_ROOT / OUT_DIR; OUT.mkdir(parents=True, exist_ok=True)
-IMG_DIR = OUT / f'{NAME}_input'; INF_DIR = OUT / f'{NAME}_inference'; INF_DIR.mkdir(parents=True, exist_ok=True)
+if MODEL.endswith('.ckpt'):                                    # своя модель из ноутбука 04: путь от корня Диска или полный
+    MODEL_PATH = MODEL if MODEL.startswith('/') else str(DRIVE_ROOT / MODEL); MODEL_TAG = Path(MODEL).stem
+else:
+    MODEL_PATH = MODEL_TAG = MODEL
+IMG_DIR = OUT / f'{NAME}_input'; INF_DIR = OUT / f'{NAME}_{MODEL_TAG}_inference'; INF_DIR.mkdir(parents=True, exist_ok=True)
 if BBOX:
     AOI_BBOX = tuple(BBOX)
 elif COMPOSITE_PATH:
@@ -144,7 +148,7 @@ print('GPU' if GPU == 0 else 'ВНИМАНИЕ: GPU нет, будет медл�
 for f in sorted(IMG_DIR.glob(f'{NAME}_b*.tif')):
     scores = INF_DIR / f'{f.stem}_scores.tif'; poly = INF_DIR / f'{f.stem}_fields.gpkg'
     if not scores.exists():
-        r = subprocess.run(['ftw', 'inference', 'run', str(f), '--model', MODEL, '--out', str(scores), '--gpu', str(GPU),
+        r = subprocess.run(['ftw', 'inference', 'run', str(f), '--model', MODEL_PATH, '--out', str(scores), '--gpu', str(GPU),
                             '--save_scores', '--num_workers', '2', '--overwrite'], capture_output=True, text=True)
         if r.returncode:
             print(r.stdout[-2000:], r.stderr[-3000:]); raise SystemExit('ошибка инференса ' + f.name)
@@ -177,14 +181,14 @@ if AOI_PATH:
     fields = fields[fields.intersects(gpd.read_file(DRIVE_ROOT / AOI_PATH).to_crs(4326).union_all())]
 print('всего полигонов до фильтра:', len(fields))
 fields = filter_fields(fields, MIN_CROP_FRAC, MIN_HA)
-out_gpkg = OUT / f'{NAME}_{MODEL}_fields.gpkg'
+out_gpkg = OUT / f'{NAME}_{MODEL_TAG}_fields.gpkg'
 fields.to_file(out_gpkg, layer='fields', driver='GPKG')
 print('Сохранено:', out_gpkg, '| медиана площади', round(fields.area_ha.median(), 1), 'га')
 
 # %% [markdown]
 # ## Шаг 6. Вероятность границы на сетку композита (для гибрида с конвейером v7)
 # Пишется `<NAME>_<MODEL>_boundary.tif` (uint8, 1–255; 0 — нет данных) на сетке `COMPOSITE_PATH`. В конвейере v7
-# укажите его в `EXT_BOUNDARY['TIF']` — линии границ нейросети станут дополнительными барьерами при слиянии.
+# укажите его в `EXT_BOUNDARY` (вместе с картой FTW Global — списком) — линии границ нейросети станут дополнительными барьерами при слиянии.
 
 # %%
 if COMPOSITE_PATH:
@@ -195,7 +199,7 @@ if COMPOSITE_PATH:
     for sc in sorted(INF_DIR.glob(f'{NAME}_b*_scores.tif')):
         b = to_grid(sc, 3, DRIVE_ROOT / COMPOSITE_PATH)          # канал 3 = граница
         ok = ~np.isnan(b); acc[ok] = np.maximum(acc[ok], np.clip(b[ok] * 254 / 255 + 1, 1, 255).astype(np.uint8))
-    bnd_tif = OUT / f'{NAME}_{MODEL}_boundary.tif'
+    bnd_tif = OUT / f'{NAME}_{MODEL_TAG}_boundary.tif'
     with rasterio.open(bnd_tif, 'w', **prof) as d:
         d.write(acc, 1)
     print('Сохранено:', bnd_tif)
@@ -213,17 +217,18 @@ if GT_PATH:
         with rasterio.open(DRIVE_ROOT / COMPOSITE_PATH) as c:
             kw = dict(transform=c.transform, shape=(c.height, c.width), crs=c.crs)
     res = evaluate(fields[fields.intersects(shapely.box(*gt.to_crs(4326).total_bounds))], gt, type_col=GT_TYPE_COL,
-                   label=f'{MODEL} {YEAR}', **kw)
-    pd.DataFrame([res]).to_csv(OUT / f'{NAME}_{MODEL}_vs_gt.csv', index=False)
+                   label=f'{MODEL_TAG} {YEAR}', **kw)
+    pd.DataFrame([res]).to_csv(OUT / f'{NAME}_{MODEL_TAG}_vs_gt.csv', index=False)
     if COMPOSITE_PATH:
         with rasterio.open(DRIVE_ROOT / COMPOSITE_PATH) as c:
             vb = transform_bounds('EPSG:4326', c.crs, *gt.to_crs(4326).total_bounds)
-        show_overlay(DRIVE_ROOT / COMPOSITE_PATH, [(fields, 'cyan', MODEL), (gt, 'red', 'эталон')], title=NAME, bbox=vb,
-                     out_png=OUT / f'{NAME}_{MODEL}_view.png')
+        show_overlay(DRIVE_ROOT / COMPOSITE_PATH, [(fields, 'cyan', MODEL_TAG), (gt, 'red', 'эталон')], title=NAME, bbox=vb,
+                     out_png=OUT / f'{NAME}_{MODEL_TAG}_view.png')
 
 # %% [markdown]
 # ## Что дальше
 # - Сравните с картой FTW (ноутбук 01) и с конвейером v6 на одном и том же участке.
 # - Если поля дробятся по культурам, а залежь пропускается — это ожидаемо: модель обучена на декларациях ЕС.
 #   Лечится либо гибридом (шаг 6 → конвейер v7), либо дообучением на ваших полях (ноутбук 04).
-# - Свою дообученную модель (файл `.ckpt` из ноутбука 04) можно подставить в `MODEL` полным путём к файлу.
+# - Свою дообученную модель (файл `.ckpt` из ноутбука 04) можно подставить в `MODEL` путём от корня Диска, например
+#   `MODEL = 'Colab_Notebooks/Agro_terra/research/ftw_finetune/out/ru_v1_FTW_PRUE_EFNET_B3_CCBY.ckpt'`.

@@ -150,9 +150,10 @@ plt.savefig(OUT / f'{NAME}_multidate_view.png', dpi=110, bbox_inches='tight'); p
 
 # %% [markdown]
 # ## Что дальше
-# В ноутбуке конвейера v7 в пресете (или в `BASE`) поставьте:
-# `EXT_TIF='…/research/multidate/out/<NAME>_multidate.tif', EXT_BAND=1, EXT_THR=0.75`.
-# Порог удобно подобрать автоматически ноутбуком 06 (укажите этот файл в `EXT_BOUNDARY_TIF`).
-# Несколько источников границ объединяются списком, например FTW + многодатные:
-# `EXT_TIF=[dict(TIF='…/TAT_ftw_prob.tif', BAND=1, THR=0.3), dict(TIF='…/TAT_2026_multidate.tif', BAND=1, THR=0.75)]`
-# (на Донбассе: только FTW — IoU 0,670; FTW + многодатные — 0,671; FTW + суперпиксели Higra — 0,676).
+# В ноутбуке конвейера v7 (ячейка параметров) укажите файл в `EXT_BOUNDARY` и выберите пресет `L_ext` или `L_ext_hg`:
+# `EXT_BOUNDARY = [dict(TIF='/content/drive/MyDrive/…/research/multidate/out/<NAME>_multidate.tif', BAND=1, THR=0.75)]`.
+# Несколько карт границ объединяются тем же списком, например FTW Global (01) + FTW/PRUE (02) + многодатные:
+# `EXT_BOUNDARY = [dict(TIF='…/TAT_ftw_prob.tif', BAND=1, THR=0.3), dict(TIF='…/TAT_2026_FTW_PRUE_EFNET_B5_boundary.tif', BAND=1, THR=0.5),
+# dict(TIF='…/TAT_2026_multidate.tif', BAND=1, THR=0.75)]`.
+# Порог удобно подобрать ноутбуком 06 (файл — в `EXT_BOUNDARY_TIF`).
+# На Донбассе: только FTW Global — IoU 0,670; FTW + многодатные — 0,671; FTW Global + PRUE 2026 + Higra — 0,684.

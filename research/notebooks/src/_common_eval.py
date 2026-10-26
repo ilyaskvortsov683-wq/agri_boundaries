@@ -47,6 +47,8 @@ def evaluate(pred, gt, transform=None, shape=None, crs=None, min_ha=5, type_col=
     gt = gt[~gt.geometry.to_wkb().duplicated()]                # в выгрузках разметки бывают повторы одного полигона
     box = shapely.box(*rasterio.transform.array_bounds(H, W, transform))
     gt = gt[gt.to_crs(crs).representative_point().within(box).values]   # эталон — только в пределах сетки (участка)
+    if not len(gt):
+        print(label, ': в пределах участка нет эталонных полей'); return dict(label=label, gt=0)
     win = rasterio.windows.from_bounds(*gt.to_crs(crs).total_bounds, transform)          # сетка — только охват эталона
     win = win.round_offsets().round_lengths()
     c0, r0 = max(int(win.col_off) - 20, 0), max(int(win.row_off) - 20, 0)
