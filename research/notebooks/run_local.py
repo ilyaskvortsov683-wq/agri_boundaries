@@ -1,31 +1,30 @@
-"""Прогон исходника ноутбука вне Colab (проверка): ячейки исполняются по очереди в одном процессе.
+"""Прогон исходника ноутбука вне Colab (проверка): ячейки исполняются по очереди в __main__, как в Colab.
 LOCAL_TEST=1 LOCAL_DRIVE=<папка-«Диск»> python3 research/notebooks/run_local.py src/01_ftw_global.py '{"YEARS":[2025]}' [номер_последней_ячейки]
 Переопределения из JSON применяются сразу после ячейки, где переменная впервые присваивается."""
-import json, re, sys, os
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from make_notebooks import expand_includes
+import json as _json, re as _re, sys as _sys, os as _os
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from make_notebooks import expand_includes as _expand
 
-os.environ.setdefault('LOCAL_TEST', '1')
-import matplotlib; matplotlib.use('Agg')
-src = Path(sys.argv[1]); over = json.loads(sys.argv[2]) if len(sys.argv) > 2 else {}
-stop = int(sys.argv[3]) if len(sys.argv) > 3 else 10 ** 9
-text = expand_includes(src.read_text(encoding='utf-8'))
-parts = re.split(r'^# %%(.*)$', text, flags=re.M)
-g = {'__name__': '__main__', 'display': print}
-done = set(); n = 0
-for i in range(1, len(parts), 2):
-    hdr, body = parts[i], parts[i + 1]
-    if '[markdown]' in hdr or not body.strip():
+_os.environ.setdefault('LOCAL_TEST', '1')
+import matplotlib as _mpl; _mpl.use('Agg')
+_RL_SRC = _Path(_sys.argv[1]); _RL_OVER = _json.loads(_sys.argv[2]) if len(_sys.argv) > 2 else {}
+_RL_STOP = int(_sys.argv[3]) if len(_sys.argv) > 3 else 10 ** 9
+_RL_PARTS = _re.split(r'^# %%(.*)$', _expand(_RL_SRC.read_text(encoding='utf-8')), flags=_re.M)
+_RL_G = globals(); _RL_G['display'] = print
+_RL_DONE = set(); _RL_N = 0
+for _RL_I in range(1, len(_RL_PARTS), 2):
+    _RL_HDR, _RL_BODY = _RL_PARTS[_RL_I], _RL_PARTS[_RL_I + 1]
+    if '[markdown]' in _RL_HDR or not _RL_BODY.strip():
         continue
-    n += 1
-    if n > stop:
+    _RL_N += 1
+    if _RL_N > _RL_STOP:
         break
-    if os.environ.get('SKIP_CELLS') and str(n) in os.environ['SKIP_CELLS'].split(','):
-        print(f'--- ячейка {n} пропущена'); continue
-    code = '\n'.join(l for l in body.split('\n') if not l.startswith('#!') and not l.startswith('#%'))
-    print(f'--- ячейка {n}')
-    exec(compile(code, f'{src.name}:cell{n}', 'exec'), g)
-    for k, v in over.items():
-        if k not in done and re.search(rf'^{re.escape(k)}\s*=', code, flags=re.M):
-            g[k] = v; done.add(k); print(f'    (переопределено {k} = {v!r})')
+    if _os.environ.get('SKIP_CELLS') and str(_RL_N) in _os.environ['SKIP_CELLS'].split(','):
+        print(f'--- ячейка {_RL_N} пропущена'); continue
+    _RL_CODE = '\n'.join(l for l in _RL_BODY.split('\n') if not l.startswith('#!') and not l.startswith('#%'))
+    print(f'--- ячейка {_RL_N}', flush=True)
+    exec(compile(_RL_CODE, f'{_RL_SRC.name}:cell{_RL_N}', 'exec'), _RL_G)
+    for _RL_K, _RL_V in _RL_OVER.items():
+        if _RL_K not in _RL_DONE and _re.search(rf'^{_re.escape(_RL_K)}\s*=', _RL_CODE, flags=_re.M):
+            _RL_G[_RL_K] = _RL_V; _RL_DONE.add(_RL_K); print(f'    (переопределено {_RL_K} = {_RL_V!r})')

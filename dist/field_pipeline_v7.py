@@ -1,5 +1,5 @@
 # %% 0_intro [markdown]
-# # Поля Самарской области: выделение → дополнение → классификация (v6)
+# # Поля: выделение → дополнение → классификация (v7)
 #
 # Один ноутбук, **шесть этапов (+ 1b — разбивка)**. Каждый включается флагом `1`/`0` в `STAGES`, и каждый может работать
 # **на ваших полях** (`IN_LAYERS`) — например, только классификация по уже готовому вектору.
@@ -14,7 +14,14 @@
 # | 5 | **Уточнение по подложке** ~1 м (XYZ-тайлы), watershed по градиенту подложки, 3 прохода | любые поля |
 # | 6 | **Классификация** (вместе с этапом 4 — один проход по полям; при включённом этапе 5 по умолчанию после него): засеянное / пар / неиспользуемое (пиксельная карта → сглаживание → класс поля, второй класс при доле ≥ 25 %, разбивка) | любые поля |
 #
-# **Что нового в v6.** Линии (лесополосы, дороги) и ступеньки тона (граница другого класса) стали барьерами ДО слияния (`LINE_SENS`, `LINE_EDGE_SENS`); границы выпрямляются
+# **Что нового в v7.** (1) **Внешняя карта границ** (`EXT_BOUNDARY` / `EXT_TIF`): вероятности границ из открытой карты FTW (ноутбук
+`research/01`), из нейросетей FTW/PRUE и Delineate Anything (`02`, `03`) или многодатные границы из GEE (`05`) становятся
+дополнительными барьерами-линиями при слиянии. Можно несколько источников списком. На Донбассе (301 эталонное поле, 2026):
+IoU 0,635 → 0,670, доля полей с IoU≥0,7: 0,55 → 0,59 (границы FTW). (2) **Суперпиксели Higra** (`SEG_METHOD='higra'`):
+иерархия водоразделов по градиенту вместо SLIC — точнее идут по границам (вместе с FTW: IoU 0,676, IoU≥0,7 0,60).
+(3) Пресеты `L_ext`, `L_ext_hg`, `L_hg`; подбор параметров под вашу разметку — ноутбук `research/06` (Optuna).
+
+**Что было в v6.** Линии (лесополосы, дороги) и ступеньки тона (граница другого класса) стали барьерами ДО слияния (`LINE_SENS`, `LINE_EDGE_SENS`); границы выпрямляются
 # (`REGULARIZE_TOL_M`); готовые полигоны всех типов должны быть на ≥ 50 % пашней WorldCover (`CROP_POLY_MIN`); пороги классов подобраны по размеченным полям;
 # у шва тайла свой потолок площади (`SEAM_MAX_REGION_HA`).
 #
@@ -34,7 +41,7 @@
 # ⚠️ Подложка (этап 5): массовое скачивание ограничено условиями провайдера; для области целиком это ~10⁵–10⁶ тайлов — запускайте по участкам.
 
 # %% 1_install
-!pip -q install rasterio scikit-image pyarrow pillow requests scikit-learn
+!pip -q install rasterio scikit-image pyarrow pillow requests scikit-learn higra optuna
 import shapely, geopandas, skimage
 print('shapely', shapely.__version__, '| geopandas', geopandas.__version__, '| skimage', skimage.__version__)
 
@@ -114,6 +121,11 @@ YELLOW_MIN_THR = 85         # средний min-канал региона вы�
 REGULARIZE_TOL_M = 18       # финальное выпрямление границ: допуск упрощения (м) с общей топологией соседних полей (0 — выкл.); эталонные поля ≈ 10 вершин/км
 CROP_POLY_MIN  = 0.5        # ГОТОВЫЙ полигон любого типа (основные, мелкие, жёлтые) должен быть не менее чем на эту долю пашней WorldCover (0 — выкл.)
 
+# ───────────── Внешняя карта границ (v7) ─────────────
+# GeoTIFF с вероятностью/силой границы на любой сетке: *_ftw_prob.tif (ноутбук 01), *_boundary.tif (02/03), *_multidate.tif (05).
+# Путь относительно DRIVE_DIR или абсолютный. Используется пресетами L_ext / L_ext_hg (в остальных можно задать EXT_TIF вручную).
+EXT_BOUNDARY = None          # например '/content/drive/MyDrive/Colab_Notebooks/Agro_terra/research/ftw_global/out/TAT_ftw_prob.tif'
+
 # ───────────── Этап 1: основные поля ─────────────
 BASE = dict(
     # сегментация (каналы 0–255)
@@ -154,10 +166,13 @@ BASE = dict(
     LINE_FILL=True,        # пиксели линий отдаются ближайшему региону (поля соприкасаются по линии)
     # внешняя карта границ (v7): вероятность/сила границы из FTW (ноутбук 01/02), Delineate Anything (03) или многодатных
     # границ из GEE (05) — линии добавляются к барьерам-линиям до слияния; растр может быть на любой сетке (перепроецируется)
-    EXT_TIF=None,          # путь к GeoTIFF (относительно DRIVE_DIR или абсолютный); None — выкл.
+    EXT_TIF=None,          # путь к GeoTIFF (относительно DRIVE_DIR или абсолютный); или список [dict(TIF=…, BAND=1, THR=0.3), …]; None — выкл.
     EXT_BAND=1,            # канал растра
     EXT_THR=0.3,           # порог: uint8 → значение/255 ≥ EXT_THR; float → значение ≥ EXT_THR
     EXT_SKEL=True,         # утончать линии до 1 px (иначе широкая полоса «съест» узкие поля)
+    # суперпиксели (v7): 'slic' — как в v6; 'higra' — иерархия водоразделов по градиенту (точнее идёт по границам)
+    SEG_METHOD='slic',
+    HG_HIERARCHY='area',   # для 'higra': 'area' | 'volume' | 'dynamics' — по какому признаку сливаются бассейны
 )
 
 PRESETS = {
@@ -170,6 +185,10 @@ PRESETS = {
     'L_soft':     dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0, LINE_SENS=0.3, SPLIT=dict(SENS=0.6)),                   # только самые явные линии
     'L_strong':   dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0, LINE_SENS=0.7, SPLIT=dict(SENS=1.0)),                   # больше тонких линий
     'L_long':     dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0, LINE_SIGMA_ALONG=8, LINE_MIN_PX=60),                    # только длинные прямые линии
+    # ── v7: внешняя карта границ (EXT_BOUNDARY) и суперпиксели Higra ──
+    'L_ext':      dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0, EXT_TIF=EXT_BOUNDARY, EXT_THR=0.3),                       # + линии внешней карты границ (FTW/нейросеть/многодатные)
+    'L_ext_hg':   dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0, EXT_TIF=EXT_BOUNDARY, EXT_THR=0.3, SEG_METHOD='higra', HG_HIERARCHY='dynamics'),  # то же + суперпиксели Higra
+    'L_hg':       dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0, SEG_METHOD='higra', HG_HIERARCHY='dynamics'),              # только суперпиксели Higra
     'L_nowc':     dict(),                                                              # без WorldCover-барьеров
     'L_cap400':   dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0, MAX_REGION_HA=400),
     'L_sharp':    dict(BARRIER_WC_CLASSES=[10, 50, 80, 90], FILL_HOLES_HA=2.0, MERGE_THR=40, JUMP_THR=10, BARRIER_THR=22),
@@ -588,6 +607,27 @@ def relax_labels(lab, f, iters, beta):
     return lab
 
 
+def higra_superpixels(f, valid, walls, n_regions, hierarchy='area'):
+    """Суперпиксели v7 из иерархии водоразделов (библиотека Higra) вместо SLIC.
+    Градиент — максимум по каналам модуля Собеля сглаженных признаков; барьеры/линии получают максимальный градиент,
+    поэтому регионы не переходят через них. Иерархия по площади ('area'), объёму ('volume') или контрасту ('dynamics')
+    режется на n_regions регионов (≈ столько же, сколько у SLIC при том же SP_SIZE_PX). Дальше — то же слияние HAC."""
+    import higra as hg
+    from scipy.ndimage import sobel
+    g = np.zeros(valid.shape, np.float32)
+    for c in range(f.shape[-1]):
+        g = np.maximum(g, np.hypot(sobel(f[..., c], 0), sobel(f[..., c], 1)))
+    g = g / (g.max() + 1e-6)
+    g[walls] = 1.0; g[~valid] = 1.0
+    graph = hg.get_4_adjacency_graph(valid.shape)
+    w = hg.weight_graph(graph, g, hg.WeightFunction.max)
+    build = {'area': hg.watershed_hierarchy_by_area, 'volume': hg.watershed_hierarchy_by_volume,
+             'dynamics': hg.watershed_hierarchy_by_dynamics}[hierarchy]
+    tree, alt = build(graph, w)
+    lab = hg.labelisation_horizontal_cut_from_num_regions(tree, alt, int(n_regions))
+    return lab.astype(np.int32) + 1
+
+
 def segment_regions(feats, valid, crop=None, wcmap=None, ext=None):
     """feats (h,w,3) float32 0–255; valid (h,w) bool; ext — внешняя карта линий-границ (h,w) bool или None (v7).
     Возвращает (метки регионов, маска барьеров).
@@ -615,9 +655,12 @@ def segment_regions(feats, valid, crop=None, wcmap=None, ext=None):
         return np.where(valid[..., None], x, 0).astype(np.float32)
 
     f = prep(SMOOTH_SIGMA)
-    lab = slic(f / 255.0, n_segments=max(int(valid.size / SP_SIZE_PX), 1), compactness=COMPACTNESS,
-               convert2lab=False, channel_axis=-1, start_label=1, enforce_connectivity=True,
-               min_size_factor=0.25, max_size_factor=4)
+    if SEG_METHOD == 'higra':
+        lab = higra_superpixels(f, valid, line_b | barrier, max(int(valid.sum() / SP_SIZE_PX), 1), HG_HIERARCHY)
+    else:
+        lab = slic(f / 255.0, n_segments=max(int(valid.size / SP_SIZE_PX), 1), compactness=COMPACTNESS,
+                   convert2lab=False, channel_axis=-1, start_label=1, enforce_connectivity=True,
+                   min_size_factor=0.25, max_size_factor=4)
     lab = lab.astype(np.int32)
     lab[~seg_valid] = 0
     lab = cc_label(lab, connectivity=1, background=0).astype(np.int32)   # половинки суперпикселя за барьером — разные регионы
@@ -1202,20 +1245,26 @@ _EXT = {}
 
 
 def ext_window(t_halo, h, w):
-    """Внешняя карта границ (EXT_TIF) на сетке окна тайла → bool (h,w) или None. Растр может быть на любой сетке:
-    перепроецируется максимумом (тонкие линии не теряются). Порог EXT_THR, затем утончение до 1 px (EXT_SKEL)."""
+    """Внешняя карта границ на сетке окна тайла → bool (h,w) или None.
+    EXT_TIF — путь к GeoTIFF (тогда канал EXT_BAND, порог EXT_THR) или список источников
+    [dict(TIF=…, BAND=1, THR=0.3), …] — линии всех источников объединяются (например, FTW + многодатные границы).
+    Растр может быть на любой сетке: перепроецируется максимумом (тонкие линии не теряются); затем порог и
+    утончение до 1 px (EXT_SKEL)."""
     if not EXT_TIF:
         return None
     from rasterio.warp import reproject, Resampling
-    pth = Path(EXT_TIF) if os.path.isabs(str(EXT_TIF)) else Path(DRIVE_DIR) / EXT_TIF
-    pid = os.getpid()
-    if (pid, str(pth)) not in _EXT:
-        _EXT[(pid, str(pth))] = rasterio.open(pth)
-    s = _EXT[(pid, str(pth))]
-    a = np.zeros((h, w), np.float32)
-    reproject(rasterio.band(s, int(EXT_BAND)), a, dst_transform=t_halo, dst_crs=CRS, dst_nodata=0, resampling=Resampling.max)
-    a = a / 255.0 if s.dtypes[int(EXT_BAND) - 1] == 'uint8' else a
-    m = a >= float(EXT_THR)
+    srcs = EXT_TIF if isinstance(EXT_TIF, (list, tuple)) else [dict(TIF=EXT_TIF, BAND=EXT_BAND, THR=EXT_THR)]
+    m = np.zeros((h, w), bool)
+    for d in srcs:
+        pth = Path(d['TIF']) if os.path.isabs(str(d['TIF'])) else Path(DRIVE_DIR) / d['TIF']
+        key = (os.getpid(), str(pth))
+        if key not in _EXT:
+            _EXT[key] = rasterio.open(pth)
+        s = _EXT[key]; band = int(d.get('BAND', 1))
+        a = np.zeros((h, w), np.float32)
+        reproject(rasterio.band(s, band), a, dst_transform=t_halo, dst_crs=CRS, dst_nodata=0, resampling=Resampling.max)
+        a = a / 255.0 if s.dtypes[band - 1] == 'uint8' else a
+        m |= a >= float(d.get('THR', EXT_THR))
     if EXT_SKEL and m.any():
         m = skeletonize(m)
     return m

@@ -343,6 +343,27 @@ def relax_labels(lab, f, iters, beta):
     return lab
 
 
+def higra_superpixels(f, valid, walls, n_regions, hierarchy='area'):
+    """Суперпиксели v7 из иерархии водоразделов (библиотека Higra) вместо SLIC.
+    Градиент — максимум по каналам модуля Собеля сглаженных признаков; барьеры/линии получают максимальный градиент,
+    поэтому регионы не переходят через них. Иерархия по площади ('area'), объёму ('volume') или контрасту ('dynamics')
+    режется на n_regions регионов (≈ столько же, сколько у SLIC при том же SP_SIZE_PX). Дальше — то же слияние HAC."""
+    import higra as hg
+    from scipy.ndimage import sobel
+    g = np.zeros(valid.shape, np.float32)
+    for c in range(f.shape[-1]):
+        g = np.maximum(g, np.hypot(sobel(f[..., c], 0), sobel(f[..., c], 1)))
+    g = g / (g.max() + 1e-6)
+    g[walls] = 1.0; g[~valid] = 1.0
+    graph = hg.get_4_adjacency_graph(valid.shape)
+    w = hg.weight_graph(graph, g, hg.WeightFunction.max)
+    build = {'area': hg.watershed_hierarchy_by_area, 'volume': hg.watershed_hierarchy_by_volume,
+             'dynamics': hg.watershed_hierarchy_by_dynamics}[hierarchy]
+    tree, alt = build(graph, w)
+    lab = hg.labelisation_horizontal_cut_from_num_regions(tree, alt, int(n_regions))
+    return lab.astype(np.int32) + 1
+
+
 def segment_regions(feats, valid, crop=None, wcmap=None, ext=None):
     """feats (h,w,3) float32 0–255; valid (h,w) bool; ext — внешняя карта линий-границ (h,w) bool или None (v7).
     Возвращает (метки регионов, маска барьеров).
@@ -370,9 +391,12 @@ def segment_regions(feats, valid, crop=None, wcmap=None, ext=None):
         return np.where(valid[..., None], x, 0).astype(np.float32)
 
     f = prep(SMOOTH_SIGMA)
-    lab = slic(f / 255.0, n_segments=max(int(valid.size / SP_SIZE_PX), 1), compactness=COMPACTNESS,
-               convert2lab=False, channel_axis=-1, start_label=1, enforce_connectivity=True,
-               min_size_factor=0.25, max_size_factor=4)
+    if SEG_METHOD == 'higra':
+        lab = higra_superpixels(f, valid, line_b | barrier, max(int(valid.sum() / SP_SIZE_PX), 1), HG_HIERARCHY)
+    else:
+        lab = slic(f / 255.0, n_segments=max(int(valid.size / SP_SIZE_PX), 1), compactness=COMPACTNESS,
+                   convert2lab=False, channel_axis=-1, start_label=1, enforce_connectivity=True,
+                   min_size_factor=0.25, max_size_factor=4)
     lab = lab.astype(np.int32)
     lab[~seg_valid] = 0
     lab = cc_label(lab, connectivity=1, background=0).astype(np.int32)   # половинки суперпикселя за барьером — разные регионы

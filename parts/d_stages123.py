@@ -58,20 +58,26 @@ _EXT = {}
 
 
 def ext_window(t_halo, h, w):
-    """Внешняя карта границ (EXT_TIF) на сетке окна тайла → bool (h,w) или None. Растр может быть на любой сетке:
-    перепроецируется максимумом (тонкие линии не теряются). Порог EXT_THR, затем утончение до 1 px (EXT_SKEL)."""
+    """Внешняя карта границ на сетке окна тайла → bool (h,w) или None.
+    EXT_TIF — путь к GeoTIFF (тогда канал EXT_BAND, порог EXT_THR) или список источников
+    [dict(TIF=…, BAND=1, THR=0.3), …] — линии всех источников объединяются (например, FTW + многодатные границы).
+    Растр может быть на любой сетке: перепроецируется максимумом (тонкие линии не теряются); затем порог и
+    утончение до 1 px (EXT_SKEL)."""
     if not EXT_TIF:
         return None
     from rasterio.warp import reproject, Resampling
-    pth = Path(EXT_TIF) if os.path.isabs(str(EXT_TIF)) else Path(DRIVE_DIR) / EXT_TIF
-    pid = os.getpid()
-    if (pid, str(pth)) not in _EXT:
-        _EXT[(pid, str(pth))] = rasterio.open(pth)
-    s = _EXT[(pid, str(pth))]
-    a = np.zeros((h, w), np.float32)
-    reproject(rasterio.band(s, int(EXT_BAND)), a, dst_transform=t_halo, dst_crs=CRS, dst_nodata=0, resampling=Resampling.max)
-    a = a / 255.0 if s.dtypes[int(EXT_BAND) - 1] == 'uint8' else a
-    m = a >= float(EXT_THR)
+    srcs = EXT_TIF if isinstance(EXT_TIF, (list, tuple)) else [dict(TIF=EXT_TIF, BAND=EXT_BAND, THR=EXT_THR)]
+    m = np.zeros((h, w), bool)
+    for d in srcs:
+        pth = Path(d['TIF']) if os.path.isabs(str(d['TIF'])) else Path(DRIVE_DIR) / d['TIF']
+        key = (os.getpid(), str(pth))
+        if key not in _EXT:
+            _EXT[key] = rasterio.open(pth)
+        s = _EXT[key]; band = int(d.get('BAND', 1))
+        a = np.zeros((h, w), np.float32)
+        reproject(rasterio.band(s, band), a, dst_transform=t_halo, dst_crs=CRS, dst_nodata=0, resampling=Resampling.max)
+        a = a / 255.0 if s.dtypes[band - 1] == 'uint8' else a
+        m |= a >= float(d.get('THR', EXT_THR))
     if EXT_SKEL and m.any():
         m = skeletonize(m)
     return m
