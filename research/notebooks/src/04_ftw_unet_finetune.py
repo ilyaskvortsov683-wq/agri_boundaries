@@ -58,6 +58,10 @@ SOURCES = [
          win_a=('2026-04-10', '2026-05-31'), win_b=('2026-07-15', '2026-08-31'), role='test'),
     dict(name='glocab', path='glocab', year=2019,
          win_a=('2019-04-10', '2019-05-31'), win_b=('2019-07-15', '2019-08-31'), role='train'),
+    # Разметка на всю область, например Донецкую (если это проверенные поля, а не результат конвейера). Тестовый
+    # участок и поля рядом с ним из неё вырезаются автоматически (см. конец шага 2):
+    # dict(name='dnr_2026', path='Colab_Notebooks/Agro_terra/DON/DNR_type_2026.geojson', year=2026,
+    #      win_a=('2026-04-10', '2026-05-31'), win_b=('2026-07-15', '2026-08-31'), role='train'),
     # dict(name='tat_2025', path='Colab_Notebooks/Agro_terra/fields/tat_2025.gpkg', year=2025,
     #      win_a=('2025-05-01', '2025-06-15'), win_b=('2025-07-25', '2025-09-10'), role='train'),
 ]
@@ -68,6 +72,7 @@ CHIP = 256                         # размер фрагмента, пиксе
 MIN_LABELED = 0.5                  # фрагмент берётся, если ≥ 50 % его пикселей размечены (не «неизвестно»)
 BOUNDARY_PX = 1                    # толщина класса «граница» в пикселях (с каждой стороны линии)
 VAL_FRAC = 0.15                    # доля train-фрагментов на валидацию (выбирается блоками, не случайными пикселями)
+MAX_CHIPS_PER_SOURCE = 3000        # не больше стольких фрагментов с одного источника (~3 ГБ памяти; для разметки на всю область)
 
 EPOCHS_FROZEN = 5                  # эпох только с декодером (кодировщик заморожен)
 EPOCHS_FULL = 25                   # эпох целиком
@@ -87,7 +92,7 @@ RUN_NAME = 'ru_v1'
 # блока, что не поле, — это «фон»; всё вне блока — «неизвестно».
 
 # %%
-import numpy as np, pandas as pd, geopandas as gpd, shapely, rasterio, zipfile, urllib.request
+import numpy as np, pandas as pd, geopandas as gpd, shapely, rasterio, rasterio.windows, zipfile, urllib.request
 from rasterio.features import rasterize
 from rasterio.warp import transform_bounds
 OUT = DRIVE_ROOT / OUT_DIR; OUT.mkdir(parents=True, exist_ok=True)
@@ -161,6 +166,17 @@ for src in SOURCES:
         g = g[g.geometry.notna()]
         terr = g.buffer(0.001).union_all().buffer(-0.0005)        # размеченная территория: поля + узкие промежутки между ними
         LABELS.append((src, g[['geometry']].reset_index(drop=True), terr))
+# Тестовая территория (+ ~2 км) и поля, задевающие её, убираются из обучающих источников: иначе проверка нечестная
+# (например, если в SOURCES и вся разметка области в роли 'train', и тестовый участок из неё же в роли 'test').
+tests = [t for s, g, t in LABELS if s['role'] == 'test']
+if tests:
+    hole = shapely.union_all(tests).buffer(0.02)
+    for k, (s, g, t) in enumerate(LABELS):
+        if s['role'] == 'train' and t.intersects(hole):
+            cut = g.intersects(hole).values
+            t2 = t.difference(shapely.union_all([hole] + list(g.geometry.values[cut])))
+            LABELS[k] = (s, g[~cut].reset_index(drop=True), t2)
+            print(f"{s['name']}: убрано {cut.sum()} полей у тестовой территории")
 for s, g, t in LABELS:
     print(f"{s['name']:>14}: {len(g):6d} полей, год {s['year']}, роль {s['role']}")
 
@@ -196,10 +212,10 @@ print('снимков:', len(list(IMG.glob('*.tif'))))
 
 
 # %%
-def make_mask(gdf, terr, transform, shape, crs, boundary_px=1):
-    g = gdf.to_crs(crs)
+def make_mask(g, terr, transform, shape, boundary_px=1):
+    """g — поля и terr — размеченная территория, уже в СК снимка. Маска: 0 фон, 1 поле, 2 граница, 3 неизвестно."""
     ids = rasterize([(geom, i + 1) for i, geom in enumerate(g.geometry.values)], out_shape=shape, transform=transform,
-                    fill=0, dtype='int32')
+                    fill=0, dtype='int32') if len(g) else np.zeros(shape, np.int32)
     b = np.zeros(shape, bool)
     b[:, :-1] |= ids[:, :-1] != ids[:, 1:]; b[:, 1:] |= ids[:, :-1] != ids[:, 1:]
     b[:-1] |= ids[:-1] != ids[1:]; b[1:] |= ids[:-1] != ids[1:]
@@ -207,26 +223,40 @@ def make_mask(gdf, terr, transform, shape, crs, boundary_px=1):
         from scipy.ndimage import binary_dilation
         b = binary_dilation(b, iterations=boundary_px - 1)
     m = np.where(ids > 0, 1, 0).astype(np.uint8); m[b] = 2
-    known = rasterize([(gpd.GeoSeries([terr], crs=4326).to_crs(crs).iloc[0], 1)], out_shape=shape, transform=transform,
-                      fill=0, dtype='uint8') > 0
+    known = rasterize([(terr, 1)], out_shape=shape, transform=transform, fill=0, dtype='uint8') > 0 if not terr.is_empty \
+        else np.zeros(shape, bool)
     m[~known] = 3
     return m
 
 
+# Снимок читается полосами высотой CHIP (с запасом в пару пикселей для линий границ на стыке полос), поэтому
+# хватает памяти и на экспорт целой области.
 X, Y, META = [], [], []
 for s, g, terr in LABELS:
+    n0 = len(X)
     for f in sorted(IMG.glob(f"{RUN_NAME}_{s['name']}_{s['year']}*.tif")):
+        k = 0
         with rasterio.open(f) as src:
-            img = src.read().astype(np.uint16); T, crs = src.transform, src.crs
-        mask = make_mask(g, terr, T, img.shape[1:], crs, BOUNDARY_PX)
-        H, W = mask.shape; k = 0
-        for r in range(0, H - CHIP + 1, CHIP):
-            for c in range(0, W - CHIP + 1, CHIP):
-                mm = mask[r:r + CHIP, c:c + CHIP]; im = img[:, r:r + CHIP, c:c + CHIP]
-                if (mm != 3).mean() < MIN_LABELED or (im.sum(0) == 0).mean() > 0.05:
+            gg = g.to_crs(src.crs); tt = gpd.GeoSeries([terr], crs=4326).to_crs(src.crs).iloc[0]; sidx = gg.sindex
+            halo = BOUNDARY_PX + 1
+            for r in range(0, src.height - CHIP + 1, CHIP):
+                win = rasterio.windows.Window(0, r - halo, src.width, CHIP + 2 * halo)
+                box = shapely.box(*rasterio.windows.bounds(win, src.transform))
+                if not tt.intersects(box):
                     continue
-                X.append(im); Y.append(mm); META.append((s['name'], s['role'], r // CHIP, c // CHIP)); k += 1
+                mask = make_mask(gg.iloc[sidx.query(box)], tt.intersection(box), src.window_transform(win),
+                                 (CHIP + 2 * halo, src.width), BOUNDARY_PX)[halo:-halo]
+                img = src.read(window=rasterio.windows.Window(0, r, src.width, CHIP)).astype(np.uint16)
+                for c in range(0, src.width - CHIP + 1, CHIP):
+                    mm = mask[:, c:c + CHIP]; im = img[:, :, c:c + CHIP]
+                    if (mm != 3).mean() < MIN_LABELED or (im.sum(0) == 0).mean() > 0.05:
+                        continue
+                    X.append(im); Y.append(mm); META.append((s['name'], s['role'], r // CHIP, c // CHIP)); k += 1
         print(f"{f.name}: фрагментов {k}")
+    if len(X) - n0 > MAX_CHIPS_PER_SOURCE:                     # большой источник (вся область) — случайная выборка
+        keep = n0 + np.sort(np.random.default_rng(1).choice(len(X) - n0, MAX_CHIPS_PER_SOURCE, replace=False))
+        X[n0:], Y[n0:], META[n0:] = [X[i] for i in keep], [Y[i] for i in keep], [META[i] for i in keep]
+        print(f"{s['name']}: оставлено {MAX_CHIPS_PER_SOURCE} фрагментов")
 X = np.stack(X); Y = np.stack(Y); META = pd.DataFrame(META, columns=['source', 'role', 'row', 'col'])
 np.savez_compressed(DATA / f'chips_{RUN_NAME}.npz', X=X, Y=Y)
 META.to_csv(DATA / f'chips_{RUN_NAME}.csv', index=False)
@@ -249,7 +279,8 @@ print('train', len(train_idx), '| val', len(val_idx), '| test', len(test_idx))
 # %% [markdown]
 # ## Шаг 6. Модель, потери, метрики
 # Модель берётся из реестра ftw-tools (веса качаются автоматически). Потеря — как у PRUE: log-cosh Dice + CE с весами
-# классов (фон 0,05 / поле 0,2 / граница 0,75), «неизвестно» игнорируется. Нормировка входа — деление на 3000, как у FTW.
+# классов (фон 0,05 / поле 0,2 / граница 0,75), «неизвестно» игнорируется. Вход — как в `ftw inference run`: деление на
+# 3000 и увеличение снимка в 2 раза (`RESIZE`) перед сетью; ответ сети уменьшается обратно до 10 м.
 
 # %%
 import torch, torch.nn as nn
@@ -261,7 +292,14 @@ ck_dir = Path(torch.hub.get_dir()) / 'checkpoints'; ck_dir.mkdir(parents=True, e
 BASE_CKPT = ck_dir / f'{BASE_MODEL}.ckpt'
 if not BASE_CKPT.exists():
     torch.hub.download_url_to_file(MODEL_REGISTRY[BASE_MODEL].url, str(BASE_CKPT))
-NORM = MODEL_REGISTRY[BASE_MODEL].normalization
+NORM, RESIZE = 3000.0, 2            # как в ftw-tools: image / 3000 и --resize_factor 2
+
+
+def fwd(m, x):
+    """Прямой проход как при инференсе FTW: снимок ×2 (билинейно) → сеть → логиты обратно на сетку 10 м."""
+    h, w = x.shape[-2:]
+    y = m(nn.functional.interpolate(x, scale_factor=RESIZE, mode='bilinear', align_corners=False))
+    return nn.functional.interpolate(y, size=(h, w), mode='bilinear', align_corners=False)
 
 
 def new_model():
@@ -288,10 +326,10 @@ def evaluate_chips(model, idx):
     """Пиксельные IoU классов «поле» и «граница» (как в статьях FTW) на фрагментах idx."""
     model.eval(); inter = np.zeros(3); union = np.zeros(3)
     for x, y in batches(idx):
-        p = model(x).argmax(1); ok = y != 3
+        p = fwd(model, x).argmax(1); ok = y != 3
         for c in (1, 2):
             inter[c] += ((p == c) & (y == c) & ok).sum().item(); union[c] += (((p == c) | (y == c)) & ok).sum().item()
-    return dict(IoU_field=round(inter[1] / max(union[1], 1), 3), IoU_boundary=round(inter[2] / max(union[2], 1), 3))
+    return dict(IoU_field=round(float(inter[1] / max(union[1], 1)), 3), IoU_boundary=round(float(inter[2] / max(union[2], 1)), 3))
 
 
 base = new_model()
@@ -317,7 +355,7 @@ for phase, epochs, lr in (('decoder', EPOCHS_FROZEN, LR), ('full', EPOCHS_FULL, 
         for x, y in batches(train_idx, shuffle=True, aug=True):
             opt.zero_grad()
             with torch.autocast(DEV, enabled=DEV == 'cuda'):
-                loss = crit(model(x), y)
+                loss = crit(fwd(model, x), y)
             scaler.scale(loss).backward(); scaler.step(opt); scaler.update(); tl += loss.item(); n += 1
         sch.step()
         v = evaluate_chips(model, val_idx) if len(val_idx) else evaluate_chips(model, train_idx[:200])
@@ -356,7 +394,7 @@ if len(test_idx):
     i = test_idx[np.argmax([(Y[j] == 1).mean() for j in test_idx])]
     x = torch.from_numpy(X[i:i + 1].astype(np.float32) / NORM).to(DEV)
     with torch.no_grad():
-        p0 = base(x).argmax(1)[0].cpu().numpy(); p1 = model(x).argmax(1)[0].cpu().numpy()
+        p0 = fwd(base, x).argmax(1)[0].cpu().numpy(); p1 = fwd(model, x).argmax(1)[0].cpu().numpy()
     rgb = np.clip(X[i, [4, 5, 6]].transpose(1, 2, 0) / 3000, 0, 1)
     fig, ax = plt.subplots(1, 4, figsize=(18, 5))
     for a, (im, t) in zip(ax, [(rgb, 'снимок (окно B)'), (Y[i], 'разметка'), (p0, 'исходная модель'), (p1, 'после дообучения')]):

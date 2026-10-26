@@ -4,7 +4,7 @@
 Нужны: pandoc, reportlab, шрифты DejaVu (кириллица).
 Chromium-печать даёт PDF в 3-4 раза больше, поэтому здесь свой рендер.
 """
-import json, subprocess, sys
+import json, re, subprocess, sys
 from xml.sax.saxutils import escape
 from reportlab import rl_config
 from reportlab.lib import colors
@@ -191,9 +191,11 @@ def page_no(canv, doc):
 
 def main(src, dst):
     ast = json.loads(subprocess.check_output(['pandoc', src, '-f', 'gfm', '-t', 'json']))
+    h1 = next((b for b in ast['blocks'] if b['t'] == 'Header' and b['c'][0] == 1), None)   # заголовок PDF = первый «# …»
+    title = re.sub(r'<[^>]+>', '', inl(h1['c'][2])) if h1 else 'agri_boundaries'
     doc = SimpleDocTemplate(dst, pagesize=A4, leftMargin=14 * mm, rightMargin=14 * mm,
                             topMargin=14 * mm, bottomMargin=14 * mm,
-                            title='Алгоритмы выделения полей Sentinel-2', author='agri_boundaries',
+                            title=title, author='agri_boundaries',
                             pageCompression=1)
     story = blocks(ast['blocks'], doc.width)
     doc.build(story, onFirstPage=page_no, onLaterPages=page_no)

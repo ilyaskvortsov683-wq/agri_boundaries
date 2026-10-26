@@ -9,9 +9,9 @@
 # подбираются, восточная (**B**) — контроль. Если на B результат тоже вырос — параметры переносятся, а не «подогнаны».
 #
 # **Что нужно:** тестовый растр (фрагмент вашего композита), разметка полей на него (как для Донбасса),
-# скрипт конвейера `field_pipeline_v7.py` (лежит в `research/classical_v7`).
+# ноутбук конвейера `field_pipeline_TAT_v7.ipynb` (лежит в `research/classical_v7`; его ячейки исполняются здесь же).
 # По желанию — внешняя карта границ (`*_ftw_prob.tif` из ноутбука 01, `*_boundary.tif` из 02/03 или
-# `*_multidate_edges.tif` из 05) в `EXT_BOUNDARY_TIF`: тогда подбирается и её порог.
+# `*_multidate.tif` из 05) в `EXT_BOUNDARY_TIF`: тогда подбирается и её порог.
 #
 # **Время:** один пробный запуск — 1–3 мин на участке ~20×20 км (CPU). 40 проб ≈ 1–2 ч. Ячейку поиска можно
 # прерывать и запускать снова — пробы копятся в файле базы Optuna на Диске и не теряются.
@@ -22,11 +22,12 @@
 # ## Шаг 1. Параметры
 
 # %%
-PIPELINE_PY = 'Colab_Notebooks/Agro_terra/research/classical_v7/field_pipeline_v7.py'
+PIPELINE_PY = 'Colab_Notebooks/Agro_terra/research/classical_v7/field_pipeline_TAT_v7.ipynb'   # ноутбук v7 (или .py)
 TEST_TIF = 'Colab_Notebooks/Agro_terra/test/don_composite.tif'       # тестовый композит (3 канала)
 GT_PATH = 'Colab_Notebooks/Agro_terra/test/gt_pieces.gpkg'           # разметка полей на этот участок
 GT_TYPE_COL = 'type'
-EXT_BOUNDARY_TIF = None              # внешняя карта границ на этот участок (необязательно), напр. '…/don_ftw_prob.tif'
+EXT_BOUNDARY_TIF = None              # внешняя карта границ на этот участок (необязательно), напр. '…/don_ftw_prob.tif';
+                                     # несколько карт — списком [dict(TIF='…', BAND=1, THR=0.3), …] (тогда пороги не подбираются)
 EE_PROJECT = 'my-project-20260614-499410'
 BASE_PRESET = 'L_base'               # от какого пресета отталкиваемся
 N_TRIALS = 40
@@ -56,7 +57,8 @@ if WC_NPY:
     from unittest.mock import MagicMock; sys.modules['ee'] = MagicMock()
 NS = globals()
 load_pipeline(DRIVE_ROOT / PIPELINE_PY, over, NS)
-gt_all = gpd.read_file(DRIVE_ROOT / GT_PATH)
+from rasterio.warp import transform_bounds
+gt_all = load_gt(DRIVE_ROOT / GT_PATH, transform_bounds(GRID['crs'], 'EPSG:4326', *rasterio.transform.array_bounds(*GRID['shape'], GRID['transform'])))
 GT_A, GT_B = gt_halves(gt_all)
 print('конвейер загружен; эталон: A', len(GT_A), '| B', len(GT_B))
 
@@ -64,8 +66,14 @@ print('конвейер загружен; эталон: A', len(GT_A), '| B', le
 # ## Шаг 3. Исходная точка: пресет `BASE_PRESET` как есть (и с внешними границами, если заданы)
 
 # %%
+def ext_param():
+    if isinstance(EXT_BOUNDARY_TIF, (list, tuple)):
+        return [dict(d, TIF=str(DRIVE_ROOT / d['TIF'])) for d in EXT_BOUNDARY_TIF]
+    return str(DRIVE_ROOT / EXT_BOUNDARY_TIF)
+
+
 rows = []
-base_params = {} if not EXT_BOUNDARY_TIF else dict(EXT_TIF=str(DRIVE_ROOT / EXT_BOUNDARY_TIF), EXT_THR=0.3)
+base_params = {} if not EXT_BOUNDARY_TIF else dict(EXT_TIF=ext_param(), EXT_THR=0.3)
 for nm, prm in [('base', {})] + ([('base+ext', base_params)] if EXT_BOUNDARY_TIF else []):
     sa, sb, a, b = score(run_trial(NS, prm, 'B0'), GT_A, GT_B, GRID)
     rows.append(dict(name=nm, score_A=round(sa, 3), score_B=round(sb, 3), **{f'A_{k}': v for k, v in a.items() if k != 'label'},
@@ -92,7 +100,9 @@ def objective(trial):
     if p['SEG_METHOD'] == 'higra':
         p['HG_HIERARCHY'] = trial.suggest_categorical('HG_HIERARCHY', ['area', 'volume', 'dynamics'])
     if EXT_BOUNDARY_TIF:
-        p.update(EXT_TIF=str(DRIVE_ROOT / EXT_BOUNDARY_TIF), EXT_THR=trial.suggest_float('EXT_THR', 0.15, 0.8))
+        p['EXT_TIF'] = ext_param()
+        if not isinstance(EXT_BOUNDARY_TIF, (list, tuple)):
+            p['EXT_THR'] = trial.suggest_float('EXT_THR', 0.15, 0.8)
     t0 = time.time()
     sa, sb, a, b = score(run_trial(NS, p, 'T'), GT_A, GT_B, GRID)
     for k, v in {**{f'A_{k}': v for k, v in a.items()}, **{f'B_{k}': v for k, v in b.items()}}.items():
@@ -124,7 +134,7 @@ top = df.sort_values('value', ascending=False)[cols].head(10); display(top); top
 display(BASELINE[['name', 'score_A', 'score_B', 'A_IoU', 'B_IoU', 'A_bF', 'B_bF']])
 best = dict(study.best_params)
 if EXT_BOUNDARY_TIF:
-    best['EXT_TIF'] = EXT_BOUNDARY_TIF
+    best['EXT_TIF'] = ext_param()                                  # полный путь /content/drive/MyDrive/…
 json.dump({f'TUNED_{STUDY}': {**dict(NS['PRESETS'][BASE_PRESET]), **best}}, open(OUT / 'best_preset.json', 'w'),
           ensure_ascii=False, indent=1, default=str)
 print('Сохранено:', OUT / 'best_preset.json')

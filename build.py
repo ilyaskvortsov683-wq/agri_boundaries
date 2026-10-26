@@ -46,7 +46,8 @@ for i in range(1, len(sp), 3):
         s = '\n'.join(l[2:] if l.startswith('# ') else l.lstrip('#') for l in body.splitlines())
         cells.append({'cell_type': 'markdown', 'metadata': {}, 'source': s.splitlines(keepends=True)})
     else:
-        cells.append({'cell_type': 'code', 'metadata': {}, 'execution_count': None, 'outputs': [], 'source': body.splitlines(keepends=True)})
+        cells.append({'cell_type': 'code', 'metadata': {'name': sp[i]}, 'execution_count': None, 'outputs': [],   # имя — для research/06
+                      'source': body.splitlines(keepends=True)})
 nb = {'cells': cells, 'metadata': {'colab': {'provenance': []}, 'kernelspec': {'display_name': 'Python 3', 'name': 'python3'},
                                    'language_info': {'name': 'python'}}, 'nbformat': 4, 'nbformat_minor': 5}
 (DIST / 'field_pipeline_TAT_v7.ipynb').write_text(json.dumps(nb, ensure_ascii=False, indent=1), encoding='utf-8')

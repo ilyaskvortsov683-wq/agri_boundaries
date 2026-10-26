@@ -47,7 +47,8 @@ def build(src, out, gpu=False):
     print(out.name, len(nb['cells']), 'ячеек')
 
 
-NOTEBOOKS = [('01_ftw_global.py', '01_FTW_Global.ipynb', False),
+NOTEBOOKS = [('00_update_from_github.py', '00_Update_from_GitHub.ipynb', False),
+             ('01_ftw_global.py', '01_FTW_Global.ipynb', False),
              ('02_ftw_prue.py', '02_FTW_PRUE_ftw_tools.ipynb', True),
              ('03_delineate_anything_v2.py', '03_Delineate_Anything_v2.ipynb', True),
              ('04_ftw_unet_finetune.py', '04_FTW_UNet_finetune.ipynb', True),

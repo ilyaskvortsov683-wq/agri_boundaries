@@ -1,6 +1,6 @@
 # %% [markdown]
 # ### Ядро автоподбора (выполните без изменений)
-# - `load_pipeline()` — исполняет ячейки скрипта конвейера v7 в этом же
+# - `load_pipeline()` — исполняет ячейки конвейера v7 (ноутбук `.ipynb` или скрипт `.py`) в этом же
 #   ноутбуке: функции этапов становятся доступны, сами этапы не запускаются (включён режим сравнения пресетов).
 # - `run_trial(params)` — прогоняет один набор параметров (как пресет поверх `BASE_PRESET`) по всем этапам на тестовом
 #   участке и возвращает финальный слой полей.
@@ -11,13 +11,29 @@
 import re, copy, numpy as np, pandas as pd, geopandas as gpd, shapely
 
 
+def pipeline_cells(path):
+    """Ячейки конвейера v7 [(имя, код)] из field_pipeline_TAT_v7.ipynb (имена — в метаданных ячеек;
+    если Colab их потерял — узнаём ячейки по содержимому) или из field_pipeline_v7.py (строки `# %% имя`)."""
+    text = Path(path).read_text(encoding='utf-8')
+    if str(path).endswith('.ipynb'):
+        out = []
+        for k, c in enumerate(json.loads(text)['cells']):
+            if c['cell_type'] != 'code':
+                continue
+            body = ''.join(c['source']); name = c.get('metadata', {}).get('name')
+            if not name:
+                name = ('2_params' if re.search(r'^DRIVE_DIR\s*=', body, flags=re.M) else '18_compare' if 'def run_all' in body
+                        else '9_segmentation_stage' if 'def get_wc_map' in body else f'cell{k}')
+            out.append((name, body))
+    else:
+        parts = re.split(r'^# %% (\S+)(?: \[markdown\])?\n', text, flags=re.M)
+        out = [(parts[i], parts[i + 1]) for i in range(1, len(parts), 2)]
+    return [(n, re.sub(r'^\s*!.*$', '', b, flags=re.M)) for n, b in out]      # строки !pip — не Python
+
+
 def load_pipeline(py_path, overrides, ns):
     """ns — глобальное пространство имён ноутбука (globals()): так параллельные процессы тайлов видят функции конвейера."""
-    text = Path(py_path).read_text(encoding='utf-8')
-    text = re.sub(r'^!pip.*$', '', text, flags=re.M)
-    parts = re.split(r'^# %% (\S+)(?: \[markdown\])?\n', text, flags=re.M)
-    for i in range(1, len(parts), 2):
-        name, body = parts[i], parts[i + 1]
+    for name, body in pipeline_cells(py_path):
         if name == '0_intro':
             continue
         if name == '18_compare':                    # нужны только функции (run_all); сам прогон пресетов не запускаем

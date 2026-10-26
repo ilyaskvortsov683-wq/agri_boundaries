@@ -1,5 +1,5 @@
 """Прогон исходника ноутбука вне Colab (проверка): ячейки исполняются по очереди в __main__, как в Colab.
-LOCAL_TEST=1 LOCAL_DRIVE=<папка-«Диск»> python3 research/notebooks/run_local.py src/01_ftw_global.py '{"YEARS":[2025]}' [номер_последней_ячейки]
+[MOCK_EE=1] [SKIP_CELLS=4,6] LOCAL_DRIVE=<папка-«Диск»> python3 research/notebooks/run_local.py src/01_ftw_global.py '{"YEARS":[2025]}' [номер_последней_ячейки]
 Переопределения из JSON применяются сразу после ячейки, где переменная впервые присваивается."""
 import json as _json, re as _re, sys as _sys, os as _os
 from pathlib import Path as _Path
@@ -7,6 +7,8 @@ _sys.path.insert(0, str(_Path(__file__).resolve().parent))
 from make_notebooks import expand_includes as _expand
 
 _os.environ.setdefault('LOCAL_TEST', '1')
+if _os.environ.get('MOCK_EE'):                       # без GEE: ee подменяется заглушкой, ячейки экспорта пропускают готовые файлы
+    from unittest.mock import MagicMock as _MM; _sys.modules['ee'] = _MM()
 import matplotlib as _mpl; _mpl.use('Agg')
 _RL_SRC = _Path(_sys.argv[1]); _RL_OVER = _json.loads(_sys.argv[2]) if len(_sys.argv) > 2 else {}
 _RL_STOP = int(_sys.argv[3]) if len(_sys.argv) > 3 else 10 ** 9

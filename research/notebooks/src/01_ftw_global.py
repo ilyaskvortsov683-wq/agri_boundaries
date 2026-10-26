@@ -221,7 +221,7 @@ else:
 
 # %%
 if GT_PATH:
-    gt = gpd.read_file(DRIVE_ROOT / GT_PATH)
+    gt = load_gt(DRIVE_ROOT / GT_PATH, AOI_BBOX)
     gt_bbox = tuple(gt.to_crs(4326).total_bounds)
     rows = []
     for y, g in FTW.items():
@@ -240,8 +240,9 @@ else:
 # %%
 VIEW_BBOX = None          # (lon_min, lat_min, lon_max, lat_max) или None
 if VIEW_BBOX is None:
-    if GT_PATH:
-        VIEW_BBOX = tuple(gpd.read_file(DRIVE_ROOT / GT_PATH).to_crs(4326).total_bounds)
+    gb = tuple(gt.to_crs(4326).total_bounds) if GT_PATH and len(gt) else None
+    if gb and gb[2] - gb[0] < 0.4 and gb[3] - gb[1] < 0.3:        # разметка на небольшой участок — показываем её охват
+        VIEW_BBOX = gb
     else:
         cx, cy = (AOI_BBOX[0] + AOI_BBOX[2]) / 2, (AOI_BBOX[1] + AOI_BBOX[3]) / 2
         VIEW_BBOX = (cx - .07, cy - .045, cx + .07, cy + .045)
@@ -250,7 +251,7 @@ if COMPOSITE_PATH:
     colors = ['cyan', 'white', 'lime', 'orange', 'yellow']
     lays = [(g[g.intersects(shapely.box(*VIEW_BBOX))], colors[i % 5], f'FTW {y}') for i, (y, g) in enumerate(FTW.items())][-2:]
     if GT_PATH:
-        lays.append((gpd.read_file(DRIVE_ROOT / GT_PATH), 'red', 'эталон'))
+        lays.append((gt[gt.to_crs(4326).intersects(shapely.box(*VIEW_BBOX))], 'red', 'эталон'))
     show_overlay(DRIVE_ROOT / COMPOSITE_PATH, lays, title=f'{NAME}: FTW', bbox=vb, out_png=OUT / f'{NAME}_ftw_view.png')
 
 # %% [markdown]
@@ -266,7 +267,7 @@ folium.GeoJson(g[['score', 'area_ha', 'geometry']], name=f'FTW {y}',
                style_function=lambda f: {'color': 'yellow', 'weight': 1, 'fillOpacity': 0},
                tooltip=folium.GeoJsonTooltip(['score', 'area_ha'])).add_to(m)
 if GT_PATH:
-    folium.GeoJson(gpd.read_file(DRIVE_ROOT / GT_PATH).to_crs(4326), name='эталон',
+    folium.GeoJson(gt.to_crs(4326)[lambda d: d.intersects(shapely.box(*VIEW_BBOX))], name='эталон',
                    style_function=lambda f: {'color': 'red', 'weight': 1, 'fillOpacity': 0}).add_to(m)
 folium.LayerControl().add_to(m)
 m

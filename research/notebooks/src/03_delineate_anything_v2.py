@@ -230,7 +230,7 @@ if COMPOSITE_PATH:
 
 # %%
 if GT_PATH:
-    gt = gpd.read_file(DRIVE_ROOT / GT_PATH); kw = {}
+    gt = load_gt(DRIVE_ROOT / GT_PATH, AOI_BBOX); kw = {}
     if COMPOSITE_PATH:
         with rasterio.open(DRIVE_ROOT / COMPOSITE_PATH) as c:
             kw = dict(transform=c.transform, shape=(c.height, c.width), crs=c.crs)

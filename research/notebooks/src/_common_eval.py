@@ -10,10 +10,23 @@
 # - **охват** — доля площади эталона, покрытая полигонами; по классам (если в эталоне есть колонка `type`).
 
 # %%
-import numpy as np, geopandas as gpd, shapely, rasterio
+import numpy as np, geopandas as gpd, shapely, rasterio, rasterio.windows
 from rasterio.features import rasterize
 from rasterio.transform import from_origin
 from scipy import ndimage as ndi
+
+
+def load_gt(path, bbox=None):
+    """Эталонная разметка: только полигоны в рамке bbox (EPSG:4326: lon_min, lat_min, lon_max, lat_max), без пустых
+    и повторных. Так можно указывать разметку на всю область (например DNR_type_2026.geojson), а сравнивать на участке."""
+    box = gpd.GeoSeries([shapely.box(*bbox)], crs=4326) if bbox is not None else None
+    g = gpd.read_file(path, bbox=box)
+    g = g[g.geometry.notna()]
+    if bbox is not None:
+        g = g[g.to_crs(4326).representative_point().within(box.iloc[0]).values]
+    g = g[~g.geometry.to_wkb().duplicated()].reset_index(drop=True)
+    print('эталон:', len(g), 'полигонов', '(в рамке участка)' if bbox is not None else '')
+    return g
 
 
 def grid_for(gdf, res=10.0):
@@ -31,6 +44,16 @@ def evaluate(pred, gt, transform=None, shape=None, crs=None, min_ha=5, type_col=
         transform, shape, crs = grid_for(gt)
     H, W = shape
     gt = gt[gt.geometry.notna()].copy(); pred = pred[pred.geometry.notna()].copy()
+    gt = gt[~gt.geometry.to_wkb().duplicated()]                # в выгрузках разметки бывают повторы одного полигона
+    box = shapely.box(*rasterio.transform.array_bounds(H, W, transform))
+    gt = gt[gt.to_crs(crs).representative_point().within(box).values]   # эталон — только в пределах сетки (участка)
+    win = rasterio.windows.from_bounds(*gt.to_crs(crs).total_bounds, transform)          # сетка — только охват эталона
+    win = win.round_offsets().round_lengths()
+    c0, r0 = max(int(win.col_off) - 20, 0), max(int(win.row_off) - 20, 0)
+    W, H = min(int(win.col_off + win.width) + 20, W) - c0, min(int(win.row_off + win.height) + 20, H) - r0
+    transform = rasterio.windows.transform(rasterio.windows.Window(c0, r0, W, H), transform)
+    if H * W > 4e8:
+        print(f'ВНИМАНИЕ: эталон охватывает {H}×{W} пикселей — оценка займёт много памяти; задайте участок поменьше (BBOX)')
     gt['geometry'] = shapely.make_valid(gt.geometry.values); pred['geometry'] = shapely.make_valid(pred.geometry.values)
     ea = 6933                                                  # равновеликая СК для площадей
     g6 = gt.to_crs(ea); g6 = g6[g6.area / 1e4 >= min_ha].reset_index(drop=True)
@@ -78,9 +101,11 @@ def show_overlay(img_path, layers, title='', bbox=None, out_png=None, bands=(1, 
     import matplotlib.pyplot as plt
     from rasterio.windows import from_bounds
     with rasterio.open(img_path) as s:
-        win = from_bounds(*bbox, s.transform) if bbox is not None else None
-        a = s.read(list(bands), window=win, boundless=True).astype(float)
-        t = s.window_transform(win) if win is not None else s.transform; crs = s.crs
+        win = from_bounds(*bbox, s.transform) if bbox is not None else rasterio.windows.Window(0, 0, s.width, s.height)
+        k = max(1.0, max(win.width, win.height) / 2500)                  # большие охваты читаются с прореживанием
+        shp = (len(bands), int(win.height / k), int(win.width / k))
+        a = s.read(list(bands), window=win, boundless=True, out_shape=shp).astype(float)
+        t = s.window_transform(win) * rasterio.Affine.scale(win.width / shp[2], win.height / shp[1]); crs = s.crs
     for i in range(a.shape[0]):
         lo, hi = np.nanpercentile(a[i][a[i] > 0], [2, 98]) if (a[i] > 0).any() else (0, 1)
         a[i] = np.clip((a[i] - lo) / (hi - lo + 1e-9), 0, 1)
