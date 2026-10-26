@@ -20,8 +20,9 @@ from reportlab.platypus import (KeepTogether, Paragraph, Preformatted, SimpleDoc
 rl_config.useA85 = 0  # без ASCII85: файл на четверть меньше
 FD = '/usr/share/fonts/truetype/dejavu/'
 pdfmetrics.registerFont(TTFont('DV', FD + 'DejaVuSans.ttf'))
-# один шрифт на весь документ: каждый встроенный шрифт добавляет ~20 КБ;
+# один пропорциональный шрифт + моноширинный только для блоков кода: каждый встроенный шрифт добавляет ~20 КБ;
 # жирный заменён цветом и подчёркиванием
+pdfmetrics.registerFont(TTFont('DVM', FD + 'DejaVuSansMono.ttf'))
 pdfmetrics.registerFontFamily('DV', normal='DV', bold='DV', italic='DV', boldItalic='DV')
 
 GREEN = colors.HexColor('#1d4e2c')
@@ -30,16 +31,16 @@ base = ParagraphStyle('base', fontName='DV', fontSize=9.2, leading=12.6, alignme
                       spaceAfter=4, splitLongWords=1)
 S = {
     'p': base,
-    'h1': ParagraphStyle('h1', base, fontName='DV', fontSize=16, leading=20, textColor=GREEN,
+    'h1': ParagraphStyle('h1', base, keepWithNext=1, fontName='DV', fontSize=16, leading=20, textColor=GREEN,
                          spaceBefore=4, spaceAfter=8),
-    'h2': ParagraphStyle('h2', base, fontName='DV', fontSize=12.5, leading=16, textColor=GREEN,
+    'h2': ParagraphStyle('h2', base, keepWithNext=1, fontName='DV', fontSize=12.5, leading=16, textColor=GREEN,
                          spaceBefore=12, spaceAfter=5),
-    'h3': ParagraphStyle('h3', base, fontName='DV', fontSize=10.5, leading=14,
+    'h3': ParagraphStyle('h3', base, keepWithNext=1, fontName='DV', fontSize=10.5, leading=14,
                          textColor=colors.HexColor('#2b5d3a'), spaceBefore=8, spaceAfter=3),
-    'h4': ParagraphStyle('h4', base, fontName='DV', fontSize=9.6, textColor=GREEN, leading=13, spaceBefore=6),
+    'h4': ParagraphStyle('h4', base, keepWithNext=1, fontName='DV', fontSize=9.6, textColor=GREEN, leading=13, spaceBefore=6),
     'cell': ParagraphStyle('cell', base, fontSize=7.4, leading=9.2, spaceAfter=0),
     'hcell': ParagraphStyle('hcell', base, fontName='DV', fontSize=7.4, textColor=GREEN, leading=9.2, spaceAfter=0),
-    'code': ParagraphStyle('code', base, fontName='DV', fontSize=7.0, leading=8.8,
+    'code': ParagraphStyle('code', base, fontName='DVM', fontSize=6.9, leading=8.8,
                            backColor=colors.HexColor('#f3f3f3'), borderPadding=4,
                            spaceBefore=3, spaceAfter=7),
     'quote': ParagraphStyle('quote', base, leftIndent=10, textColor=colors.HexColor('#333333'),
@@ -160,7 +161,7 @@ def blocks(bs, width, indent=0):
                     out.append(Paragraph(inl(first['c']), st, bulletText=mark))
                 out += blocks(rest, width - 12, indent + 12)
         elif t == 'CodeBlock':
-            out.append(Preformatted(c[1], S['code'], maxLineLength=110, newLineChars=''))
+            out.append(Preformatted(c[1], S['code'], maxLineLength=118, newLineChars='  '))
         elif t == 'BlockQuote':
             for sub in c:
                 if sub['t'] in ('Para', 'Plain'):
