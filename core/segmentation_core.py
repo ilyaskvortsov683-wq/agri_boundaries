@@ -343,14 +343,18 @@ def relax_labels(lab, f, iters, beta):
     return lab
 
 
-def segment_regions(feats, valid, crop=None, wcmap=None):
-    """feats (h,w,3) float32 0–255; valid (h,w) bool. Возвращает (метки регионов, маска барьеров).
+def segment_regions(feats, valid, crop=None, wcmap=None, ext=None):
+    """feats (h,w,3) float32 0–255; valid (h,w) bool; ext — внешняя карта линий-границ (h,w) bool или None (v7).
+    Возвращает (метки регионов, маска барьеров).
     SLIC без параметра mask (с ним в ~30 раз медленнее): невалидное заполняется нулём и обнуляется после."""
     barrier = detect_barriers(feats, valid, wcmap) if (BARRIER_THR or len(BARRIER_WC_CLASSES)) \
         else np.zeros(valid.shape, bool)
     line_b = np.zeros(valid.shape, bool)
     if LINE_SENS:
         line_b = detect_line_barriers(feats, valid, LINE_SENS, LINE_SIGMA_ALONG, LINE_MIN_PX, LINE_EDGE_SENS)
+    if ext is not None:
+        line_b |= ext
+    if LINE_SENS or ext is not None:
         if LINE_DIL > 0 and line_b.any():
             line_b = binary_dilation(line_b, structure=np.ones((3, 3), bool), iterations=int(LINE_DIL))
         line_b &= valid & ~barrier                  # там, где уже барьер-лесополоса, линия не нужна

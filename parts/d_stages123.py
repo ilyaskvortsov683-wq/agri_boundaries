@@ -54,6 +54,29 @@ def read_window(win):
     return np.nan_to_num(np.moveaxis(arr, 0, -1)), valid
 
 
+_EXT = {}
+
+
+def ext_window(t_halo, h, w):
+    """Внешняя карта границ (EXT_TIF) на сетке окна тайла → bool (h,w) или None. Растр может быть на любой сетке:
+    перепроецируется максимумом (тонкие линии не теряются). Порог EXT_THR, затем утончение до 1 px (EXT_SKEL)."""
+    if not EXT_TIF:
+        return None
+    from rasterio.warp import reproject, Resampling
+    pth = Path(EXT_TIF) if os.path.isabs(str(EXT_TIF)) else Path(DRIVE_DIR) / EXT_TIF
+    pid = os.getpid()
+    if (pid, str(pth)) not in _EXT:
+        _EXT[(pid, str(pth))] = rasterio.open(pth)
+    s = _EXT[(pid, str(pth))]
+    a = np.zeros((h, w), np.float32)
+    reproject(rasterio.band(s, int(EXT_BAND)), a, dst_transform=t_halo, dst_crs=CRS, dst_nodata=0, resampling=Resampling.max)
+    a = a / 255.0 if s.dtypes[int(EXT_BAND) - 1] == 'uint8' else a
+    m = a >= float(EXT_THR)
+    if EXT_SKEL and m.any():
+        m = skeletonize(m)
+    return m
+
+
 def tile_info(tile):
     c0, r0, c1, r1 = tile['core']
     hc0, hr0, hc1, hr1 = tile['halo']
@@ -109,7 +132,7 @@ def seg_tile(tile, tdir, exclude=None, ex_tree=None):
     nv = valid[sl].sum()
     if nv == 0 or (crop & valid)[sl].sum() / nv < MIN_TILE_CROP:
         empty.touch(); return 'no cropland'
-    lab, _ = segment_regions(feats, valid, crop, wc)
+    lab, _ = segment_regions(feats, valid, crop, wc, ext_window(t_halo, h, w))
     gdf = extract_polygons(lab, feats, crop, (hc0, hr0), tile['core'], REGION, tile_id=int(hashlib.md5(tag.encode()).hexdigest()[:7], 16))
     if gdf is None or gdf.empty:
         empty.touch(); return 'no fields'

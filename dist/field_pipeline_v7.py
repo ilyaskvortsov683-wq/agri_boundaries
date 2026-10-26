@@ -152,6 +152,12 @@ BASE = dict(
     LINE_SIGMA_ALONG=4,    # длина усреднения вдоль линии; больше → только прямые длинные линии
     LINE_DIL=1,            # утолщение линии-барьера, px (закрывает разрывы)
     LINE_FILL=True,        # пиксели линий отдаются ближайшему региону (поля соприкасаются по линии)
+    # внешняя карта границ (v7): вероятность/сила границы из FTW (ноутбук 01/02), Delineate Anything (03) или многодатных
+    # границ из GEE (05) — линии добавляются к барьерам-линиям до слияния; растр может быть на любой сетке (перепроецируется)
+    EXT_TIF=None,          # путь к GeoTIFF (относительно DRIVE_DIR или абсолютный); None — выкл.
+    EXT_BAND=1,            # канал растра
+    EXT_THR=0.3,           # порог: uint8 → значение/255 ≥ EXT_THR; float → значение ≥ EXT_THR
+    EXT_SKEL=True,         # утончать линии до 1 px (иначе широкая полоса «съест» узкие поля)
 )
 
 PRESETS = {
@@ -582,14 +588,18 @@ def relax_labels(lab, f, iters, beta):
     return lab
 
 
-def segment_regions(feats, valid, crop=None, wcmap=None):
-    """feats (h,w,3) float32 0–255; valid (h,w) bool. Возвращает (метки регионов, маска барьеров).
+def segment_regions(feats, valid, crop=None, wcmap=None, ext=None):
+    """feats (h,w,3) float32 0–255; valid (h,w) bool; ext — внешняя карта линий-границ (h,w) bool или None (v7).
+    Возвращает (метки регионов, маска барьеров).
     SLIC без параметра mask (с ним в ~30 раз медленнее): невалидное заполняется нулём и обнуляется после."""
     barrier = detect_barriers(feats, valid, wcmap) if (BARRIER_THR or len(BARRIER_WC_CLASSES)) \
         else np.zeros(valid.shape, bool)
     line_b = np.zeros(valid.shape, bool)
     if LINE_SENS:
         line_b = detect_line_barriers(feats, valid, LINE_SENS, LINE_SIGMA_ALONG, LINE_MIN_PX, LINE_EDGE_SENS)
+    if ext is not None:
+        line_b |= ext
+    if LINE_SENS or ext is not None:
         if LINE_DIL > 0 and line_b.any():
             line_b = binary_dilation(line_b, structure=np.ones((3, 3), bool), iterations=int(LINE_DIL))
         line_b &= valid & ~barrier                  # там, где уже барьер-лесополоса, линия не нужна
@@ -1188,6 +1198,29 @@ def read_window(win):
     return np.nan_to_num(np.moveaxis(arr, 0, -1)), valid
 
 
+_EXT = {}
+
+
+def ext_window(t_halo, h, w):
+    """Внешняя карта границ (EXT_TIF) на сетке окна тайла → bool (h,w) или None. Растр может быть на любой сетке:
+    перепроецируется максимумом (тонкие линии не теряются). Порог EXT_THR, затем утончение до 1 px (EXT_SKEL)."""
+    if not EXT_TIF:
+        return None
+    from rasterio.warp import reproject, Resampling
+    pth = Path(EXT_TIF) if os.path.isabs(str(EXT_TIF)) else Path(DRIVE_DIR) / EXT_TIF
+    pid = os.getpid()
+    if (pid, str(pth)) not in _EXT:
+        _EXT[(pid, str(pth))] = rasterio.open(pth)
+    s = _EXT[(pid, str(pth))]
+    a = np.zeros((h, w), np.float32)
+    reproject(rasterio.band(s, int(EXT_BAND)), a, dst_transform=t_halo, dst_crs=CRS, dst_nodata=0, resampling=Resampling.max)
+    a = a / 255.0 if s.dtypes[int(EXT_BAND) - 1] == 'uint8' else a
+    m = a >= float(EXT_THR)
+    if EXT_SKEL and m.any():
+        m = skeletonize(m)
+    return m
+
+
 def tile_info(tile):
     c0, r0, c1, r1 = tile['core']
     hc0, hr0, hc1, hr1 = tile['halo']
@@ -1243,7 +1276,7 @@ def seg_tile(tile, tdir, exclude=None, ex_tree=None):
     nv = valid[sl].sum()
     if nv == 0 or (crop & valid)[sl].sum() / nv < MIN_TILE_CROP:
         empty.touch(); return 'no cropland'
-    lab, _ = segment_regions(feats, valid, crop, wc)
+    lab, _ = segment_regions(feats, valid, crop, wc, ext_window(t_halo, h, w))
     gdf = extract_polygons(lab, feats, crop, (hc0, hr0), tile['core'], REGION, tile_id=int(hashlib.md5(tag.encode()).hexdigest()[:7], 16))
     if gdf is None or gdf.empty:
         empty.touch(); return 'no fields'

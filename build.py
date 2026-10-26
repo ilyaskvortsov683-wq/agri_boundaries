@@ -1,4 +1,4 @@
-"""Сборка ноутбука Colab из частей: python3 build.py  →  dist/field_pipeline_v6.py и dist/field_pipeline_TAT_v6.ipynb.
+"""Сборка ноутбука Colab из частей: python3 build.py  →  dist/field_pipeline_v7.py и dist/field_pipeline_TAT_v7.ipynb.
 Ячейки в исходниках размечены строками `# %% имя` (и `# %% имя [markdown]`)."""
 import re, json
 from pathlib import Path
@@ -35,8 +35,8 @@ out += rd('parts/f_stage5_run.py').rstrip() + '\n'
 out += rd('parts/g_compare.py').rstrip() + '\n'
 
 DIST.mkdir(exist_ok=True)
-(DIST / 'field_pipeline_v6.py').write_text(out, encoding='utf-8')
-print('field_pipeline_v6.py:', len(out.splitlines()), 'строк')
+(DIST / 'field_pipeline_v7.py').write_text(out, encoding='utf-8')
+print('field_pipeline_v7.py:', len(out.splitlines()), 'строк')
 
 cells = []
 sp = re.split(r'^# %% (\S+)( \[markdown\])?\n', out, flags=re.M)
@@ -49,5 +49,5 @@ for i in range(1, len(sp), 3):
         cells.append({'cell_type': 'code', 'metadata': {}, 'execution_count': None, 'outputs': [], 'source': body.splitlines(keepends=True)})
 nb = {'cells': cells, 'metadata': {'colab': {'provenance': []}, 'kernelspec': {'display_name': 'Python 3', 'name': 'python3'},
                                    'language_info': {'name': 'python'}}, 'nbformat': 4, 'nbformat_minor': 5}
-(DIST / 'field_pipeline_TAT_v6.ipynb').write_text(json.dumps(nb, ensure_ascii=False, indent=1), encoding='utf-8')
-print('field_pipeline_TAT_v6.ipynb:', len(cells), 'ячеек')
+(DIST / 'field_pipeline_TAT_v7.ipynb').write_text(json.dumps(nb, ensure_ascii=False, indent=1), encoding='utf-8')
+print('field_pipeline_TAT_v7.ipynb:', len(cells), 'ячеек')
