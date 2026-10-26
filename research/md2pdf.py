@@ -197,6 +197,15 @@ def main(src, dst):
                             pageCompression=1)
     story = blocks(ast['blocks'], doc.width)
     doc.build(story, onFirstPage=page_no, onLaterPages=page_no)
+    try:  # необязательно: object streams сжимают аннотации-ссылки (~25 % размера)
+        import os, pikepdf
+        tmp = dst + '.tmp'
+        with pikepdf.open(dst) as pdf:
+            pdf.save(tmp, object_stream_mode=pikepdf.ObjectStreamMode.generate,
+                     recompress_flate=True)
+        os.replace(tmp, dst)
+    except ImportError:
+        pass
 
 
 if __name__ == '__main__':
