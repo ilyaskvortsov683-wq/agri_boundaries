@@ -31,3 +31,6 @@
 
 `methods/` — скрипты, которыми получены цифры на Донбассе: `ftw_global/ftw_global_lib.py` (чтение FTW Global с source.coop),
 `multidate/` (сборка многодатных слоёв из архива Sentinel-2 на AWS и тест границ).
+
+Отдельный инструмент рядом: `composite/` — сезонный композит max/min/diff NDVI из открытого архива Sentinel-2 без GEE
+(замена GEE-скрипта; проверен на Донбассе против композита из GEE).
