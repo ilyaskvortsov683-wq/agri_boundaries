@@ -80,8 +80,8 @@ KEEP_BLOCKS = False                  # True — не удалять промеж
 # %% [markdown]
 # ## Шаг 2 (по желанию). Выгрузить границы субъектов из вашего слоя в GEE в папку `aoi`
 # Нужно один раз, если субъекты лежат в ассете GEE. Каждый объект сохраняется как `aoi/<значение поля>.geojson`
-# (границы упрощаются до 20 м). Уже существующие файлы не перезаписываются. Свои области (не совпадающие с
-# субъектами) просто кладите в `aoi` вручную, например нарисовав в QGIS или geojson.io.
+# (границы упрощаются до 20 м). Уже существующие файлы с объектами не перезаписываются, пустые — перезаписываются.
+# Свои области (не совпадающие с субъектами) просто кладите в `aoi` вручную, например нарисовав в QGIS или geojson.io.
 
 # %%
 GEE_AOI_ASSET = None                 # напр. 'projects/my-project-20260614-499410/assets/subjects'
@@ -99,7 +99,7 @@ if GEE_AOI_ASSET:
     fc = ee.FeatureCollection(GEE_AOI_ASSET)
     for nm in fc.aggregate_array(GEE_AOI_FIELD).distinct().getInfo():
         f = AOI_DIR / (re.sub(r'[\\/:*?"<>|]+', '_', str(nm)).strip() + '.geojson')
-        if f.exists():
+        if f.exists() and len(gpd.read_file(f)):
             continue
         geo = fc.filter(ee.Filter.eq(GEE_AOI_FIELD, nm)).geometry().simplify(20).getInfo()
         gpd.GeoDataFrame({'name': [nm]}, geometry=[shapely.geometry.shape(geo)], crs=4326).to_file(f, driver='GeoJSON')
@@ -304,15 +304,36 @@ print('функции готовы')
 
 # %%
 import geopandas as gpd, shapely
+AOI_DIR = DRIVE_ROOT / SCRIPT_DIR / 'aoi'
 aoi_path = AOI_DIR / f'{AOI}.geojson'
 assert aoi_path.exists(), f'нет файла {aoi_path} — положите границу области в папку aoi'
-AOI_GEOM = shapely.make_valid(gpd.read_file(aoi_path).to_crs(4326).union_all())
+
+
+def geoms(p):
+    """Объекты файла с непустой геометрией."""
+    g = gpd.read_file(p)
+    return g[g.geometry.notna() & ~g.geometry.is_empty]
+
+
+g = geoms(aoi_path)
+if not len(g):
+    empty = [f.name for f in sorted(AOI_DIR.glob('*.geojson')) if f.stat().st_size < 2000 and not len(geoms(f))]
+    raise ValueError(f'в файле {aoi_path.name} нет ни одной геометрии (0 объектов) — пересохраните его с объектами. '
+                     f'Пустых файлов в папке aoi: {len(empty)} ({", ".join(empty[:10])}{"…" if len(empty) > 10 else ""})')
+u = shapely.make_valid(shapely.union_all(g.to_crs(4326).geometry.make_valid().values))
+parts = [x for x in getattr(u, 'geoms', [u]) if x.geom_type in ('Polygon', 'MultiPolygon')]   # только площадные части
+assert parts, f'в файле {aoi_path.name} нет полигонов (только точки или линии)'
+AOI_GEOM = shapely.union_all(parts)
+km2 = gpd.GeoSeries([AOI_GEOM], crs=4326).to_crs(6933).area.iloc[0] / 1e6
+print(f"область {AOI}: объектов {len(g)}, {f'{km2:,.0f}'.replace(',', ' ')} км²")
 D0, D1 = f'{YEAR}-{START}', f'{YEAR}-{END}'
 NAME = f"{NAME_PREFIX}composite_{YEAR}_{START.replace('-', '')}_{END.replace('-', '')}"
 if MODE == 'test':
-    cx, cy = TEST_CENTER or (AOI_GEOM.representative_point().x, AOI_GEOM.representative_point().y)
+    pt = AOI_GEOM.representative_point()
+    cx, cy = TEST_CENTER or (pt.x, pt.y)
     dx, dy = TEST_KM / 2 / (111.32 * math.cos(math.radians(cy))), TEST_KM / 2 / 110.57
     WORK_GEOM = shapely.box(cx - dx, cy - dy, cx + dx, cy + dy)
+    assert WORK_GEOM.intersects(AOI_GEOM), f'тестовый квадрат ({cx:.3f}, {cy:.3f}) не задевает область {AOI} — исправьте TEST_CENTER или поставьте None'
 else:
     WORK_GEOM = AOI_GEOM
 if GRID == 'gee':
